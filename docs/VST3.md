@@ -8,11 +8,11 @@ Build with Visual Studio 2022, a Windows SDK, Git and CMake 3.25 or newer:
 
 ```sh
 cmake -S . -B build-vst3 -A x64 -DBUNCANCEL_BUILD_VST3=ON
-cmake --build build-vst3 --config Release --target BunCancel --parallel
+cmake --build build-vst3 --config Release --target BunCancel validator --parallel
 ```
 
-The SDK validator runs after linking. The `Experimental Windows VST3` GitHub
-Actions workflow additionally locates and validates the complete bundle and
+Run the built `validator.exe` with the path to the complete `BunCancel.vst3` bundle.
+The `Experimental Windows VST3` GitHub Actions workflow runs this check and
 uploads an unsigned experimental artifact. A workflow definition is not evidence
 that a Windows build or validator run has passed. Install the complete
 `BunCancel.vst3` directory into the host's VST3 search location; building does not
@@ -82,7 +82,7 @@ documentation submodules are not fetched or used.
 
 The [official licensing guidance](https://steinbergmedia.github.io/vst3_dev_portal/pages/VST%2B3%2BLicensing/VST3%2BLicense)
 explains MIT licensing and separate trademark usage rules. The SDK notices must
-remain with redistributions. No VST logo is included. The experimental package is
+remain with redistributions. The SDK supplies the Windows bundle icon. The experimental package is
 unsigned; no signing, public release or real-world compatibility claim follows
 from compilation or validator success.
 
