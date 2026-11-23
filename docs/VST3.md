@@ -65,7 +65,7 @@ Run `ctest --test-dir build-vst3 -C Release -V -R "^reference-(timeline|pipeline
 | −1000 ppm capture clock, uneven packet delivery | 0.00 dB | 29.52 dB |
 | Ordinary 480-frame capture and 256-frame mic blocks | 41.17 dB | 41.04 dB |
 
-With speech-like playback, settled far-only ERLE was 40.70 dB. During simultaneous independent speech, the projection of the output onto the clean near-end stem was 0.997 and residual error energy was 2.24% of near-end energy. Independent speech without bleed and speech over a silent reference were bit-exact dry. A silent mic produced exact zero, including after training. With ±1 ms callback scheduling jitter the far-only score fell to 13.12 dB. After a simulated 250 ms reference outage, evidence of reduction returned in 889 ms. Physical headsets, room impulse responses and host buffering can produce different results.
+With speech-like playback, settled far-only ERLE was 40.70 dB. During simultaneous independent speech, the projection of the output onto the clean near-end stem was 0.997 and residual error energy was 2.24% of near-end energy. Independent speech without bleed and speech over a silent reference were bit-exact dry. A silent mic produced exact zero, including after training. With ±1 ms callback scheduling jitter the far-only score fell to 13.12 dB. After a simulated 250 ms reference outage, alignment returned in 889 ms and the processor reported measured cancellation after 931 ms. Physical headsets, room impulse responses and host buffering can produce different results.
 
 ## Pinned dependency and licenses
 

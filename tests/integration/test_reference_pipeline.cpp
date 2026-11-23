@@ -124,7 +124,8 @@ struct Metrics {
   int resetBlocks{};
   int finalDelay{};
   bool finalAligned{};
-  double recoveryMs{};
+  double alignmentRecoveryMs{};
+  double cancellationRecoveryMs{};
 };
 
 struct Scenario {
@@ -173,6 +174,11 @@ Metrics run(const Scenario &scenario, bool oldFifo) {
   int readyBlocks = 0;
   int reducingBlocks = 0;
   bool previousUsable = true;
+  bool haveReference = false;
+  bool sawCancellingBeforeTransition = false;
+  bool sawReadyAfterTransition = false;
+  int interruptedBlocks = 0;
+  int prefillReadyBlocks = 0;
   for (int start = 0; start < frames; start += scenario.block) {
     const int count = std::min(scenario.block, frames - start);
     const int schedulingJitter =
@@ -259,19 +265,51 @@ Metrics run(const Scenario &scenario, bool oldFifo) {
       observation.enabled = true;
       observation.selected = true;
       observation.connected = true;
-      observation.processing = usable;
-      observation.reducing = engine.aligned() && diagnostic.reductionValid &&
-                             diagnostic.reductionDb > 0.1F;
+      observation.processing = true;
+      observation.interrupted = !usable && (haveReference || start > rate / 10);
+      haveReference |= usable;
+      const bool micQuiet = std::all_of(mic.begin(), mic.begin() + count,
+                                        [](float value) { return value == 0; });
+      observation.reducing = usable && engine.aligned() &&
+                             diagnostic.reductionValid &&
+                             diagnostic.reductionDb > 0 && !micQuiet;
       const auto status =
           buncancel::plugin::selectProcessingStatus(observation);
-      if (usable && !observation.reducing) {
-        require(status == buncancel::plugin::ProcessingStatus::readyMonitoring,
-                "compatible signal stream was not ready while monitoring");
+      using buncancel::plugin::ProcessingStatus;
+      if (observation.interrupted) {
+        require(status == ProcessingStatus::interruptedReference,
+                "missing established reference was not reported interrupted");
+        ++interruptedBlocks;
+      } else if (!observation.reducing) {
+        require(status == ProcessingStatus::readyMonitoring,
+                "compatible processing stream was not ready while monitoring");
         ++readyBlocks;
-      } else if (usable) {
-        require(status == buncancel::plugin::ProcessingStatus::cancelling,
+        prefillReadyBlocks += !usable;
+      } else {
+        require(status == ProcessingStatus::cancelling,
                 "measured subtraction was not distinguished from readiness");
         ++reducingBlocks;
+      }
+      if (usable && (scenario.independent || scenario.silentMic ||
+                     scenario.silentReference)) {
+        require(status == ProcessingStatus::readyMonitoring,
+                "independent or silent signal did not remain ready");
+      }
+      if (scenario.changingEcho) {
+        if (start > rate && start < 2 * rate &&
+            status == ProcessingStatus::cancelling) {
+          sawCancellingBeforeTransition = true;
+        }
+        if (start > 5 * rate + rate / 2 &&
+            status == ProcessingStatus::readyMonitoring) {
+          sawReadyAfterTransition = true;
+        }
+      }
+      if (scenario.loss && start > 3 * rate + rate / 4 &&
+          status == ProcessingStatus::cancelling &&
+          metrics.cancellationRecoveryMs == 0) {
+        metrics.cancellationRecoveryMs =
+            (start - (3 * rate + rate / 4)) * 1000.0 / rate;
       }
     }
     metrics.callbackMaxUs = std::max(
@@ -279,8 +317,9 @@ Metrics run(const Scenario &scenario, bool oldFifo) {
         std::chrono::duration<double, std::micro>(end - begin).count());
     usable ? ++metrics.availableBlocks : ++metrics.missingBlocks;
     if (scenario.loss && start > 3 * rate + rate / 4 && engine.aligned() &&
-        metrics.recoveryMs == 0) {
-      metrics.recoveryMs = (start - (3 * rate + rate / 4)) * 1000.0 / rate;
+        metrics.alignmentRecoveryMs == 0) {
+      metrics.alignmentRecoveryMs =
+          (start - (3 * rate + rate / 4)) * 1000.0 / rate;
     }
     for (int i = 0; i < count; ++i) {
       require(std::isfinite(output[i]), "pipeline emitted nonfinite audio");
@@ -312,6 +351,11 @@ Metrics run(const Scenario &scenario, bool oldFifo) {
   if (scenario.loss && !oldFifo) {
     require(measuredLossDry, "loss fixture did not exercise missing reference");
   }
+  if (!oldFifo && scenario.changingEcho) {
+    require(
+        sawCancellingBeforeTransition && sawReadyAfterTransition,
+        "echo transitions did not demonstrate Cancelling then settled Ready");
+  }
   std::cout << scenario.name << (oldFifo ? " old_fifo" : " timeline")
             << " available=" << metrics.availableBlocks
             << " missing=" << metrics.missingBlocks
@@ -330,7 +374,10 @@ Metrics run(const Scenario &scenario, bool oldFifo) {
   std::cout << " callback_max_us=" << metrics.callbackMaxUs
             << " ready_blocks=" << readyBlocks
             << " reducing_blocks=" << reducingBlocks
-            << " recovery_ms=" << metrics.recoveryMs
+            << " interrupted_blocks=" << interruptedBlocks
+            << " prefill_ready_blocks=" << prefillReadyBlocks
+            << " alignment_recovery_ms=" << metrics.alignmentRecoveryMs
+            << " cancelling_recovery_ms=" << metrics.cancellationRecoveryMs
             << " callback_deadline_us=" << scenario.block * 1.0e6 / rate
             << '\n';
   return metrics;
@@ -451,7 +498,8 @@ int main() {
     Scenario speechOverlap{"speech_like_double_talk", true};
     speechOverlap.speechLike = true;
     const auto speech = run(speechOverlap, false);
-    require(speech.nearGain > 0.95 && speech.nearGain < 1.05,
+    require(speech.nearGain > 0.95 && speech.nearGain < 1.05 &&
+                speech.nearErrorRatio < 0.05,
             "speech-like double-talk attenuated near-end component");
     const auto varied =
         run({"packet_jitter", false, false, false, true}, false);
@@ -467,7 +515,11 @@ int main() {
     const auto recovery = run(
         {"reference_loss_recovery", false, false, false, true, true}, false);
     require(recovery.erle > 15 && recovery.finalAligned &&
-                recovery.recoveryMs < 1500,
+                recovery.alignmentRecoveryMs > 0 &&
+                recovery.alignmentRecoveryMs < 1500 &&
+                recovery.cancellationRecoveryMs >=
+                    recovery.alignmentRecoveryMs &&
+                recovery.cancellationRecoveryMs < 1500,
             "reference loss failed reacquisition");
     for (const int block : {64, 127, 512, 2048}) {
       Scenario partition{"host_block_matrix"};

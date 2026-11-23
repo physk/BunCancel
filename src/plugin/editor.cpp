@@ -92,7 +92,8 @@ const wchar_t *nextAction(ProcessingStatus status) {
     return L"Next: remove microphone monitoring from the selected playback "
            L"mix.";
   case ProcessingStatus::delayOutOfRange:
-    return L"Next: reduce playback latency or choose a more direct reference.";
+    return L"Next: compare timing with a reference closer to the playback "
+           L"source.";
   case ProcessingStatus::insufficientCorrelation:
     return L"No action required. Monitoring; no correlated echo detected.";
   case ProcessingStatus::ambiguousAlignment:

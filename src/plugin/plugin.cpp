@@ -177,14 +177,14 @@ public:
     auto *status = new StringListParameter(
         STR16("Reference / AEC status"), statusId, nullptr,
         ParameterInfo::kIsList | ParameterInfo::kIsReadOnly);
-    status->appendString(STR16("Dry - AEC off or bypassed"));
+    status->appendString(STR16("Dry - AEC disabled"));
     status->appendString(STR16("Dry - awaiting playback reference"));
     status->appendString(STR16("Dry - reference sample-rate mismatch"));
     status->appendString(STR16("Dry - unsupported reference format"));
     status->appendString(STR16("Dry - reference device unavailable"));
-    status->appendString(STR16("Dry - acquiring alignment"));
+    status->appendString(STR16("Ready - monitoring for echo"));
     status->appendString(STR16("Cancelling - alignment acquired"));
-    status->appendString(STR16("Dry - silent microphone"));
+    status->appendString(STR16("Ready - microphone quiet"));
     status->appendString(STR16("Dry - no reference selected"));
     status->appendString(STR16("Status unavailable - waiting for processor"));
     status->appendString(STR16("Dry - bypassed"));
@@ -390,7 +390,7 @@ public:
       underruns_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
       rawReferenceRms_ = rawReferencePeak_ = 0;
-      rawReferenceQpc_ = 0;
+      rawReferenceQpc_ = rawReferenceObservedQpc_ = 0;
       waitingSinceQpc_ = 0;
       stopWorker();
       running_.store(true);
@@ -453,10 +453,13 @@ public:
       }
       if (!enabled_.load() || bypass_.load())
         diagnostic.aligned = diagnostic.reducing = false;
-      if (sourceChanged) {
+      if (sourceChanged ||
+          capture_.status() != capture::CaptureStatus::running) {
         diagnostic.reference_available = false;
         diagnostic.reference_rms = diagnostic.reference_peak = 0;
-        diagnostic.reference_sample_rate = 0;
+        // A rejected format can still report the rate discovered on the device.
+        diagnostic.reference_sample_rate =
+            sourceChanged ? 0 : capture_.actual_sample_rate();
         diagnostic.timing_valid = diagnostic.candidate_valid = false;
         diagnostic.candidate_confirmed = false;
         diagnostic.aligned = diagnostic.reducing = false;
@@ -614,7 +617,7 @@ public:
       underruns_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
       rawReferenceRms_ = rawReferencePeak_ = 0;
-      rawReferenceQpc_ = 0;
+      rawReferenceQpc_ = rawReferenceObservedQpc_ = 0;
       waitingSinceQpc_ = 0;
     }
     double referenceEnergy = 0;
@@ -643,14 +646,17 @@ public:
       rawReferenceRms_ =
           static_cast<float>(std::sqrt(referenceEnergy / referenceSamples));
       rawReferencePeak_ = referencePeak;
+      // Packet delivery proves source activity even if its reported timestamp
+      // is wrong. Keep meter age independent of capture-clock correctness.
+      rawReferenceObservedQpc_ = callbackQpc_;
     }
     const auto captureStatus = capture_.status();
     const bool connected = selected > 0 && selected == connected_.load() &&
                            captureStatus == capture::CaptureStatus::running;
     diagnostic.reference_available =
-        connected && rawReferenceQpc_ && callbackQpc_ &&
-        std::abs(static_cast<double>(callbackQpc_) -
-                 static_cast<double>(rawReferenceQpc_)) < 1000000;
+        connected && rawReferenceObservedQpc_ && callbackQpc_ &&
+        callbackQpc_ >= rawReferenceObservedQpc_ &&
+        callbackQpc_ - rawReferenceObservedQpc_ < 1000000;
     diagnostic.reference_rms =
         diagnostic.reference_available ? rawReferenceRms_ : 0;
     diagnostic.reference_peak =
@@ -663,11 +669,11 @@ public:
                                  reference_.data());
     if (timing.reset_required && engine_)
       engine_->reset();
-    diagnostic.timing_valid = timing.latest_packet_qpc_100ns != 0 && qpc != 0;
+    diagnostic.timing_valid =
+        diagnostic.reference_available && rawReferenceQpc_ && qpc;
     if (diagnostic.timing_valid)
       diagnostic.timestamp_offset_ms =
-          (static_cast<double>(qpc) -
-           static_cast<double>(timing.latest_packet_qpc_100ns)) /
+          (static_cast<double>(qpc) - static_cast<double>(rawReferenceQpc_)) /
           10000;
     const bool enabled = enabled_.load() && !bypass_.load();
     const bool complete = fits && connected && timing.usable;
@@ -832,6 +838,7 @@ private:
   int audioSelection_ = 0;
   std::atomic<std::uint64_t> captureEpoch_{0};
   std::uint64_t underruns_ = 0, dropoutBase_ = 0, rawReferenceQpc_ = 0;
+  std::uint64_t rawReferenceObservedQpc_ = 0;
   std::uint64_t callbackQpc_ = 0, waitingSinceQpc_ = 0;
   float rawReferenceRms_ = 0, rawReferencePeak_ = 0;
   bool haveReference_ = false;
