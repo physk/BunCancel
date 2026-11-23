@@ -1,7 +1,9 @@
+#include "activity_window.hpp"
 #include "aec.hpp"
 #include "diagnostics.hpp"
 #include "editor.hpp"
 #include "host_clock.hpp"
+#include "local_capture.hpp"
 #include "reference_capture.hpp"
 #include "reference_timeline.hpp"
 
@@ -21,7 +23,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -31,6 +35,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <shlobj.h>
 #include <windows.h>
 #endif
 
@@ -48,6 +53,9 @@ constexpr ParamID statusId = 3;
 constexpr const char *statusRequest = "BunCancel.Status.Request";
 constexpr const char *statusReply = "BunCancel.Status.Reply";
 constexpr const char *statusAttribute = "status";
+constexpr const char *captureStart = "BunCancel.Capture.Start";
+constexpr const char *captureCancel = "BunCancel.Capture.Cancel";
+constexpr const char *captureResultAttribute = "capture.result";
 
 constexpr const char *diagnosticsAttribute = "diagnostics.v2";
 
@@ -248,6 +256,17 @@ public:
           static_cast<std::uint32_t>(diagnostic.alignment_reason) >
               static_cast<std::uint32_t>(AlignmentReason::referenceMissing))
         return kResultFalse;
+      TChar resultText[2048]{};
+      if (message->getAttributes()->getString(captureResultAttribute,
+                                              resultText, sizeof(resultText)) ==
+          kResultOk) {
+        captureResult_.clear();
+        for (auto character : resultText) {
+          if (!character)
+            break;
+          captureResult_.push_back(static_cast<wchar_t>(character));
+        }
+      }
       diagnostics_.publish(diagnostic);
       setParamNormalized(statusId,
                          static_cast<double>(status) /
@@ -289,7 +308,15 @@ public:
            diagnostics_.read(value);
   }
 
+  bool requestCapture(bool start) {
+    return getPeer() &&
+           sendMessageID(start ? captureStart : captureCancel) == kResultOk;
+  }
+
+  std::wstring captureResult() const { return captureResult_; }
+
 private:
+  std::wstring captureResult_;
   DiagnosticSnapshot diagnostics_;
   bool haveStatus_ = false;
   std::chrono::steady_clock::time_point lastStatus_{};
@@ -304,6 +331,21 @@ void refreshStatus(EditController *controller) {
 bool readDiagnostics(EditController *controller, Diagnostics &snapshot) {
   return controller &&
          static_cast<Controller *>(controller)->readDiagnostic(snapshot);
+}
+
+bool startLocalCapture(EditController *controller, const std::wstring &) {
+  return controller &&
+         static_cast<Controller *>(controller)->requestCapture(true);
+}
+
+void cancelLocalCapture(EditController *controller) {
+  if (controller)
+    static_cast<Controller *>(controller)->requestCapture(false);
+}
+
+std::wstring localCaptureResult(EditController *controller) {
+  return controller ? static_cast<Controller *>(controller)->captureResult()
+                    : std::wstring{};
 }
 
 class Processor final : public AudioEffect {
@@ -387,6 +429,7 @@ public:
       timeline_->reset();
       hostClock_.reset();
       haveReference_ = false;
+      activity_.reset();
       underruns_ = 0;
       lastUnderrunQpc_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
@@ -408,6 +451,33 @@ public:
   }
 
   tresult PLUGIN_API notify(IMessage *message) override {
+    if (message && message->getMessageID()) {
+      if (std::strcmp(message->getMessageID(), captureStart) == 0) {
+        if (!running_.load() || !processing_.load())
+          return kResultFalse;
+        std::lock_guard<std::mutex> lock(captureRequestMutex_);
+        const auto state = localCapture_.state();
+        if (state == LocalCaptureState::preparing ||
+            state == LocalCaptureState::recording ||
+            state == LocalCaptureState::appending ||
+            state == LocalCaptureState::complete ||
+            state == LocalCaptureState::writing || captureRequested_)
+          return kResultFalse;
+        if (!running_.load() || !processing_.load())
+          return kResultFalse;
+        captureResult_.clear();
+        captureRequestedSource_ = selected_.load();
+        captureRequestedEpoch_ = captureRequestEpoch_.load();
+        captureRequested_.store(true);
+        return kResultOk;
+      }
+      if (std::strcmp(message->getMessageID(), captureCancel) == 0) {
+        std::lock_guard<std::mutex> lock(captureRequestMutex_);
+        captureRequested_ = false;
+        localCapture_.cancel();
+        return kResultOk;
+      }
+    }
     if (message && message->getMessageID() &&
         std::strcmp(message->getMessageID(), statusRequest) == 0) {
       // IConnectionPoint::notify is a UI-thread API. Only atomic observations
@@ -462,6 +532,13 @@ public:
       }
       if (sourceChanged ||
           capture_.status() != capture::CaptureStatus::running) {
+        diagnostic.window_reference_observed = false;
+        diagnostic.reference_receipt_valid = false;
+        diagnostic.reference_activity_valid = false;
+        if (sourceChanged) {
+          diagnostic.window_mic_observed = false;
+          diagnostic.mic_activity_valid = false;
+        }
         diagnostic.reference_available = false;
         diagnostic.reference_rms = diagnostic.reference_peak = 0;
         // A rejected format can still report the rate discovered on the device.
@@ -475,12 +552,22 @@ public:
       if (!running_.load() || !processing_.load() || staleObservation) {
         diagnostic.last_underrun_valid = false;
         diagnostic.mic_available = false;
+        diagnostic.window_mic_observed = diagnostic.window_reference_observed =
+            false;
+        diagnostic.reference_receipt_valid = false;
+        diagnostic.reference_activity_valid = diagnostic.mic_activity_valid =
+            false;
         diagnostic.reference_available = false;
         diagnostic.timing_valid = false;
         diagnostic.candidate_valid = false;
         diagnostic.aligned = diagnostic.reducing = false;
         diagnostic.dsp_available = diagnostic.subtraction_active = false;
       }
+      diagnostic.capture_state = captureRequested_.load()
+                                     ? LocalCaptureState::preparing
+                                     : localCapture_.state();
+      diagnostic.capture_frames = localCapture_.captured_frames();
+      diagnostic.capture_total_frames = localCapture_.total_frames();
       auto reply = owned(allocateMessage());
       if (!reply || !reply->getAttributes())
         return kResultFalse;
@@ -492,6 +579,14 @@ public:
       if (reply->getAttributes()->setBinary(diagnosticsAttribute, &diagnostic,
                                             sizeof(diagnostic)) != kResultOk)
         return kResultFalse;
+      {
+        std::lock_guard<std::mutex> lock(captureRequestMutex_);
+        std::u16string text;
+        for (const auto character : captureResult_)
+          text.push_back(static_cast<char16_t>(character));
+        reply->getAttributes()->setString(captureResultAttribute,
+                                          toTChar(text));
+      }
       return sendMessage(reply);
     }
     return AudioEffect::notify(message);
@@ -500,11 +595,14 @@ public:
   tresult PLUGIN_API setProcessing(TBool state) override {
     processing_.store(state != 0);
     if (!state) {
+      captureRequestEpoch_.fetch_add(1);
+      captureRequested_.store(false);
       hostClock_.reset();
       if (timeline_)
         timeline_->reset();
       if (engine_)
         engine_->reset();
+      localCapture_.cancel();
     }
     return kResultOk;
   }
@@ -565,6 +663,11 @@ public:
       diagnostic.host_sample_rate = rate_;
       diagnostic.bypassed = bypass_.load();
       if (selected_.load() != audioSelection_) {
+        diagnostic.window_reference_observed = false;
+        diagnostic.window_mic_observed = false;
+        diagnostic.reference_receipt_valid = false;
+        diagnostic.reference_activity_valid = diagnostic.mic_activity_valid =
+            false;
         diagnostic.reference_available = false;
         diagnostic.reference_rms = diagnostic.reference_peak = 0;
         diagnostic.reference_sample_rate = 0;
@@ -617,11 +720,16 @@ public:
     }
     diagnostic.mic_rms = static_cast<float>(std::sqrt(micEnergy / frames));
     const bool micQuiet = diagnostic.mic_peak == 0;
+    blockHistoryReset_ = false;
     const auto qpc = microphoneTime(data);
     diagnostic.observation_qpc_100ns = callbackQpc_;
     const auto connection = captureEpoch_.load();
     const int selected = selected_.load();
     if (connection != audioConnection_ || selected != audioSelection_) {
+      blockHistoryReset_ = true;
+      captureRequestEpoch_.fetch_add(1);
+      captureRequested_.store(false);
+      localCapture_.cancel();
       if (timeline_)
         timeline_->reset();
       if (engine_)
@@ -629,6 +737,7 @@ public:
       audioConnection_ = connection;
       audioSelection_ = selected;
       haveReference_ = false;
+      activity_.reset();
       underruns_ = 0;
       lastUnderrunQpc_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
@@ -645,13 +754,28 @@ public:
       if (packet.channel_count >= 1 && packet.channel_count <= 2 &&
           packet.frame_count <= capture::ReferencePacket::max_frames) {
         const auto samples = packet.frame_count * packet.channel_count;
-        for (std::uint32_t i = 0; i < samples; ++i) {
-          const float sample = packet.samples[i];
-          if (std::isfinite(sample)) {
-            referenceEnergy += static_cast<double>(sample) * sample;
-            referencePeak = std::max(referencePeak, std::abs(sample));
+        SignalMoments raw, mono;
+        raw.samples = samples;
+        mono.samples = packet.frame_count;
+        for (std::uint32_t frame = 0; frame < packet.frame_count; ++frame) {
+          float downmix = 0;
+          for (std::uint32_t channel = 0; channel < packet.channel_count;
+               ++channel) {
+            const float sample =
+                packet.samples[frame * packet.channel_count + channel];
+            if (std::isfinite(sample)) {
+              raw.energy += static_cast<double>(sample) * sample;
+              raw.peak = std::max(raw.peak, std::abs(sample));
+              downmix += sample / packet.channel_count;
+            }
           }
+          mono.energy += static_cast<double>(downmix) * downmix;
+          mono.peak = std::max(mono.peak, std::abs(downmix));
         }
+        activity_.observeReference(callbackQpc_, packet.sample_rate,
+                                   packet.frame_count, raw, mono);
+        referenceEnergy += raw.energy;
+        referencePeak = std::max(referencePeak, raw.peak);
         referenceSamples += samples;
         rawReferenceQpc_ = packet.qpc_position_100ns;
       }
@@ -683,8 +807,10 @@ public:
     if (fits && connected && qpc)
       timing = timeline_->render(qpc, static_cast<std::uint32_t>(frames),
                                  reference_.data());
-    if (timing.reset_required && engine_)
+    if (timing.reset_required && engine_) {
+      blockHistoryReset_ = true;
       engine_->reset();
+    }
     diagnostic.timing_valid =
         diagnostic.reference_available && rawReferenceQpc_ && qpc;
     if (diagnostic.timing_valid)
@@ -726,10 +852,13 @@ public:
     data.outputs[0].silenceFlags = micQuiet ? 1 : 0;
     double outputEnergy = 0;
     double deltaEnergy = 0;
+    float outputPeak = 0;
     for (std::size_t i = 0; i < frames; ++i) {
       const float input = fits ? microphone_[i] : hostSilent ? 0.0f : mic[i];
-      if (std::isfinite(out[i]))
+      if (std::isfinite(out[i])) {
         outputEnergy += static_cast<double>(out[i]) * out[i];
+        outputPeak = std::max(outputPeak, std::abs(out[i]));
+      }
       if (std::isfinite(input) && std::isfinite(out[i])) {
         const double delta = static_cast<double>(input) - out[i];
         deltaEnergy += delta * delta;
@@ -779,6 +908,17 @@ public:
       diagnostic.prediction_coherence = alignment.predictionCoherence;
       diagnostic.competing_correlation = alignment.competingPeakCorrelation;
       diagnostic.shadow_validating = alignment.shadowValidating;
+      diagnostic.shadow_decision =
+          static_cast<std::uint32_t>(alignment.shadowDecision);
+      diagnostic.shadow_training_eligibility =
+          alignment.shadowTrainingEligibility;
+      diagnostic.shadow_validation_eligibility =
+          alignment.shadowValidationEligibility;
+      diagnostic.shadow_coherence = alignment.shadowCoherence;
+      diagnostic.shadow_mic_error_ratio = alignment.shadowMicErrorRatio;
+      diagnostic.shadow_foreground_error_ratio =
+          alignment.shadowForegroundErrorRatio;
+      diagnostic.shadow_validation_count = alignment.shadowValidationCount;
       diagnostic.filter_mic_rms = alignment.microphoneRms;
       diagnostic.filter_output_rms = alignment.outputRms;
       diagnostic.subtraction_active = diagnostic.dsp_available &&
@@ -808,11 +948,58 @@ public:
     observation.interrupted = interrupted;
     observation.reducing = diagnostic.reducing;
     diagnostic.status = selectProcessingStatus(observation);
+    activity_.observeMicrophone(
+        callbackQpc_, rate_, static_cast<std::uint32_t>(frames),
+        {micEnergy, diagnostic.mic_peak, frames},
+        {outputEnergy, outputPeak, frames}, diagnostic.changed_samples,
+        complete, diagnostic.subtraction_active);
+    applyActivity(diagnostic, activity_.snapshot(callbackQpc_));
+    if (fits) {
+      LocalCaptureBlock block;
+      block.microphone_qpc_100ns = qpc;
+      block.reference_qpc_100ns = rawReferenceQpc_;
+      block.diagnostics = diagnostic;
+      block.reference_usable = complete && enabled;
+      block.reset = blockHistoryReset_;
+      localCapture_.append(microphone_.data(),
+                           complete && enabled ? reference_.data() : nullptr,
+                           out, static_cast<std::uint32_t>(frames), block);
+    } else {
+      localCapture_.cancel();
+    }
     publishDiagnostics(data, diagnostic);
     return kResultOk;
   }
 
 private:
+  static void applyActivity(Diagnostics &diagnostic,
+                            const ActivitySnapshot &window) noexcept {
+    diagnostic.window_mic_rms = window.mic_rms;
+    diagnostic.window_mic_peak = window.mic_peak;
+    diagnostic.window_output_rms = window.output_rms;
+    diagnostic.window_output_peak = window.output_peak;
+    diagnostic.window_reference_rms = window.reference_rms;
+    diagnostic.window_reference_peak = window.reference_peak;
+    diagnostic.window_downmix_rms = window.downmix_rms;
+    diagnostic.window_downmix_peak = window.downmix_peak;
+    diagnostic.window_mic_seconds = window.mic_seconds;
+    diagnostic.window_reference_seconds = window.reference_seconds;
+    diagnostic.window_changed_fraction = window.changed_fraction;
+    diagnostic.window_usable_fraction = window.usable_fraction;
+    diagnostic.window_subtraction_fraction = window.subtraction_fraction;
+    diagnostic.window_mic_active_fraction = window.mic_active_fraction;
+    diagnostic.window_reference_active_fraction =
+        window.reference_active_fraction;
+    diagnostic.window_mic_observed = window.mic_observed;
+    diagnostic.window_reference_observed = window.reference_observed;
+    diagnostic.reference_receipt_valid = window.reference_receipt_valid;
+    diagnostic.reference_receipt_age_ms = window.reference_receipt_age_ms;
+    diagnostic.mic_activity_valid = window.mic_activity_valid;
+    diagnostic.mic_activity_age_ms = window.mic_activity_age_ms;
+    diagnostic.reference_activity_valid = window.reference_activity_valid;
+    diagnostic.reference_activity_age_ms = window.reference_activity_age_ms;
+  }
+
   std::uint64_t microphoneTime(const ProcessData &data) noexcept {
     std::uint64_t now = 0;
 #ifdef _WIN32
@@ -831,6 +1018,7 @@ private:
         now, static_cast<std::uint32_t>(data.numSamples), continuousValid,
         continuousValid ? data.processContext->continousTimeSamples : 0);
     if (timing.reset_required) {
+      blockHistoryReset_ = true;
       if (timeline_)
         timeline_->reset();
       if (engine_)
@@ -860,18 +1048,73 @@ private:
 
   void stopWorker() noexcept {
     running_.store(false);
+    {
+      std::lock_guard<std::mutex> lock(captureRequestMutex_);
+      captureRequested_ = false;
+      localCapture_.cancel();
+    }
     if (worker_.joinable())
       worker_.join();
     capture_.stop();
     connected_.store(0);
+    localCapture_.write_complete();
+  }
+
+  void serviceLocalCapture() noexcept {
+    try {
+      {
+        std::lock_guard<std::mutex> lock(captureRequestMutex_);
+        const bool requested =
+            captureRequested_.exchange(false) && running_.load() &&
+            processing_.load() && captureRequestedSource_ == selected_.load() &&
+            captureRequestedEpoch_ == captureRequestEpoch_.load();
+        if (requested) {
+          std::filesystem::path parent;
+#ifdef _WIN32
+          PWSTR knownFolder = nullptr;
+          if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,
+                                             KF_FLAG_DEFAULT, nullptr,
+                                             &knownFolder))) {
+            parent = std::filesystem::path(knownFolder) / L"BunCancel" /
+                     L"Diagnostics";
+            CoTaskMemFree(knownFolder);
+          }
+#endif
+          if (!localCapture_.arm(parent, rate_))
+            captureResult_ =
+                L"Capture could not start. Check the local diagnostics folder.";
+          if (!running_.load() || !processing_.load() ||
+              captureRequestedSource_ != selected_.load() ||
+              captureRequestedEpoch_ != captureRequestEpoch_.load())
+            localCapture_.cancel();
+        }
+      }
+      const auto state = localCapture_.state();
+      if (state == LocalCaptureState::complete ||
+          state == LocalCaptureState::cancelled ||
+          state == LocalCaptureState::failed) {
+        const bool saved = localCapture_.write_complete();
+        std::lock_guard<std::mutex> lock(captureRequestMutex_);
+        if (saved)
+          captureResult_ = localCapture_.saved_directory().wstring();
+        else if (localCapture_.state() == LocalCaptureState::failed)
+          captureResult_ = L"Capture could not be saved. Check free space and "
+                           L"folder permissions.";
+      }
+    } catch (...) {
+      localCapture_.cancel();
+    }
   }
 
   void controlLoop() noexcept {
     int previous = -1;
     while (running_.load()) {
+      serviceLocalCapture();
       const int requested =
           enabled_.load() && !bypass_.load() ? selected_.load() : 0;
       if (requested != previous) {
+        if (previous != -1)
+          localCapture_.cancel();
         connected_.store(0);
         capture_.stop();
         captureEpoch_.fetch_add(1);
@@ -892,6 +1135,14 @@ private:
     connected_.store(0);
   }
 
+  LocalCapture localCapture_;
+  ActivityWindow activity_;
+  std::mutex captureRequestMutex_;
+  std::atomic<bool> captureRequested_{false};
+  std::atomic<std::uint64_t> captureRequestEpoch_{};
+  std::uint64_t captureRequestedEpoch_{};
+  int captureRequestedSource_{};
+  std::wstring captureResult_;
   std::vector<capture::Endpoint> devices_;
   capture::ReferenceCapture capture_;
   std::unique_ptr<buncancel::Aec> engine_;
@@ -901,6 +1152,7 @@ private:
   int lastReportedStatus_ = -1;
   std::atomic<bool> processing_{false};
   std::uint64_t audioConnection_ = 0;
+  bool blockHistoryReset_{};
   int audioSelection_ = 0;
   std::atomic<std::uint64_t> captureEpoch_{0};
   std::uint64_t underruns_ = 0, dropoutBase_ = 0, rawReferenceQpc_ = 0;
@@ -925,10 +1177,10 @@ using namespace Steinberg::Vst;
 BEGIN_FACTORY_DEF("BunCancel", "", "")
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::processorId),
            PClassInfo::kManyInstances, kVstAudioEffectClass,
-           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.3",
+           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.4",
            kVstVersionString, buncancel::plugin::Processor::create)
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::controllerId),
            PClassInfo::kManyInstances, kVstComponentControllerClass,
-           "BunCancel Controller", 0, "", "0.1.3", kVstVersionString,
+           "BunCancel Controller", 0, "", "0.1.4", kVstVersionString,
            buncancel::plugin::Controller::create)
 END_FACTORY

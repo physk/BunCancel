@@ -8,6 +8,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <shlobj.h>
 #include <windows.h>
 
 #include <algorithm>
@@ -120,6 +121,32 @@ const wchar_t *nextAction(ProcessingStatus status) {
   return L"Next: check the host audio connection.";
 }
 
+const wchar_t *shadowOutcome(std::uint32_t decision) {
+  // These values match the DSP's public ShadowDecision diagnostic enum.
+  switch (decision) {
+  case 0:
+    return L"waiting for alignment";
+  case 1:
+    return L"training";
+  case 2:
+    return L"validating on later audio";
+  case 3:
+    return L"insufficient training";
+  case 4:
+    return L"insufficient correlated evidence";
+  case 5:
+    return L"prediction too weak";
+  case 6:
+    return L"insufficient microphone error improvement";
+  case 7:
+    return L"existing output predicts better";
+  case 8:
+    return L"candidate promoted";
+  default:
+    return L"unavailable";
+  }
+}
+
 const wchar_t *filterActivity(const Diagnostics &value) {
   if (!value.dsp_available)
     return L"Filter unavailable while reference timing is dry";
@@ -143,10 +170,12 @@ const wchar_t *filterActivity(const Diagnostics &value) {
 std::wstring diagnosticsText(const Diagnostics &value, bool available) {
   std::wstring result = meter(L"Mic", available && value.mic_available,
                               value.mic_rms, value.mic_peak);
-  result += L" (mono)";
+  result += L" (mono, last block)";
   result +=
       L"\r\n" + meter(L"Reference", available && value.reference_available,
                       value.reference_rms, value.reference_peak);
+  if (available && value.reference_available)
+    result += L" (latest received packet)";
   if (!available)
     return result +
            L"\r\nRates: unavailable\r\nGaps / underruns: unavailable"
@@ -154,6 +183,65 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
            L"\r\nCandidate lag: unavailable\r\nPacket timing: unavailable"
            L"\r\nFilter telemetry: unavailable";
   wchar_t text[320]{};
+  result += L"\r\nInstant readings above; 3 s evidence window below.";
+  if (value.window_mic_observed) {
+    result += L"\r\nWindow mic RMS/peak: " + level(value.window_mic_rms) +
+              L" / " + level(value.window_mic_peak) + L" dBFS";
+    result += L"\r\nWindow output RMS/peak: " + level(value.window_output_rms) +
+              L" / " + level(value.window_output_peak) + L" dBFS";
+    std::swprintf(
+        text, std::size(text), L" / mic evidence: %.2f s / changed: %.1f%%",
+        value.window_mic_seconds, 100 * value.window_changed_fraction);
+    result += text;
+  } else {
+    result += L"\r\nWindow mic/output: unavailable";
+  }
+  if (value.window_reference_observed) {
+    result += L"\r\nWindow raw ref RMS/peak: " +
+              level(value.window_reference_rms) + L" / " +
+              level(value.window_reference_peak) + L" dBFS";
+    result += L"\r\nWindow downmix RMS/peak: " +
+              level(value.window_downmix_rms) + L" / " +
+              level(value.window_downmix_peak) + L" dBFS";
+    std::swprintf(text, std::size(text), L" / ref evidence: %.2f s",
+                  value.window_reference_seconds);
+    result += text;
+  } else {
+    result += L"\r\nWindow reference: unavailable";
+  }
+  if (value.reference_receipt_valid) {
+    std::swprintf(text, std::size(text),
+                  L"\r\nLast reference packet received: %.3f s ago",
+                  value.reference_receipt_age_ms / 1000);
+    result += text;
+  } else {
+    result += L"\r\nReference packet receipt: none observed";
+  }
+  result += L"\r\nActivity above -60 dBFS (diagnostic threshold):";
+  if (value.mic_activity_valid) {
+    std::swprintf(text, std::size(text), L" mic %.2f s ago",
+                  value.mic_activity_age_ms / 1000);
+    result += text;
+  } else {
+    result += L" mic not observed";
+  }
+  if (value.reference_activity_valid) {
+    std::swprintf(text, std::size(text), L" / ref %.2f s ago",
+                  value.reference_activity_age_ms / 1000);
+    result += text;
+  } else {
+    result += L" / ref not observed";
+  }
+  std::swprintf(text, std::size(text),
+                L"\r\nWindow usable ref: %.1f%% / subtraction active: %.1f%%",
+                100 * value.window_usable_fraction,
+                100 * value.window_subtraction_fraction);
+  result += text;
+  std::swprintf(text, std::size(text),
+                L"\r\nObserved above-threshold time: mic %.1f%% / ref %.1f%%",
+                100 * value.window_mic_active_fraction,
+                100 * value.window_reference_active_fraction);
+  result += text;
   if (value.mic_available) {
     std::swprintf(text, std::size(text),
                   L"\r\nOutput RMS: %ls dBFS / changed: %u of %u samples",
@@ -177,7 +265,7 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
                 static_cast<unsigned long long>(value.underruns));
   result += text;
   if (value.last_underrun_valid) {
-    std::swprintf(text, std::size(text), L" / last: %.2f s ago",
+    std::swprintf(text, std::size(text), L" / last underrun: %.2f s ago",
                   value.last_underrun_age_ms / 1000);
     result += text;
   }
@@ -233,6 +321,21 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
                 L"\r\nShadow samples: %llu / promotions: %llu",
                 static_cast<unsigned long long>(value.shadow_adapted_samples),
                 static_cast<unsigned long long>(value.shadow_promotions));
+  result += text;
+  result += L"\r\nLast candidate outcome: ";
+  result += shadowOutcome(value.shadow_decision);
+  std::swprintf(text, std::size(text),
+                L"\r\nValidation cycles: %llu / eligible training/validation: "
+                L"%.1f%% / %.1f%%",
+                static_cast<unsigned long long>(value.shadow_validation_count),
+                100 * value.shadow_training_eligibility,
+                100 * value.shadow_validation_eligibility);
+  result += text;
+  std::swprintf(text, std::size(text),
+                L"\r\nCandidate coherence: %.3f / error-to-mic: %.3f / "
+                L"error-to-output: %.3f",
+                value.shadow_coherence, value.shadow_mic_error_ratio,
+                value.shadow_foreground_error_ratio);
   result += text;
   result += L"\r\nPrediction RMS: " + level(value.prediction_rms) +
             L" / subtraction RMS: " + level(value.subtraction_rms) + L" dBFS";
@@ -379,15 +482,24 @@ private:
                            ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
                            diagnosticsControlId);
     action_ = control(L"STATIC", L"", SS_LEFT, actionControlId);
-    note_ = control(
-        L"STATIC",
-        L"Use a playback mix without microphone monitoring.\r\n"
-        L"Missing reference keeps the microphone dry.\r\n"
-        L"Scroll diagnostics for filter details. Level change is not ERLE.",
-        SS_LEFT, 0);
+    capture_ = control(L"BUTTON", L"Record local diagnostic...",
+                       BS_PUSHBUTTON | WS_TABSTOP, captureControlId);
+    cancelCapture_ =
+        control(L"BUTTON", L"Cancel capture", BS_PUSHBUTTON | WS_TABSTOP,
+                cancelCaptureControlId);
+    captureStatus_ = control(
+        L"EDIT", L"Local capture idle. Records only after confirmation.",
+        ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+        captureStatusControlId);
+    note_ =
+        control(L"STATIC",
+                L"Use a playback mix without microphone monitoring.\r\n"
+                L"Scroll diagnostics for signal history and filter details.\r\n"
+                L"Level change includes speech and is not ERLE.",
+                SS_LEFT, 0);
     if (!title_ || !subtitle_ || !enable_ || !sourceLabel_ || !endpoint_ ||
         !bypass_ || !statusLabel_ || !status_ || !diagnostics_ || !action_ ||
-        !note_)
+        !note_ || !capture_ || !cancelCapture_ || !captureStatus_)
       return false;
     ParameterInfo info{};
     if (controller_->getParameterInfoByTag(endpointId, info) != kResultOk ||
@@ -421,9 +533,9 @@ private:
                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     if (font) {
-      for (auto child :
-           {title_, subtitle_, enable_, sourceLabel_, endpoint_, bypass_,
-            statusLabel_, status_, diagnostics_, action_, note_})
+      for (auto child : {title_, subtitle_, enable_, sourceLabel_, endpoint_,
+                         bypass_, statusLabel_, status_, diagnostics_, action_,
+                         note_, capture_, cancelCapture_, captureStatus_})
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
       if (font_)
         DeleteObject(font_);
@@ -441,9 +553,15 @@ private:
     place(bypass_, 204, 28);
     place(statusLabel_, 250, 22);
     place(status_, 276, 28);
-    place(diagnostics_, 312, 150);
-    place(action_, 470, 56);
-    place(note_, 532, 60);
+    place(diagnostics_, 312, 118);
+    place(action_, 438, 40);
+    const int gap = pixel(12);
+    MoveWindow(capture_, pixel(24), pixel(482), (width - gap) / 2, pixel(28),
+               TRUE);
+    MoveWindow(cancelCapture_, pixel(24) + (width + gap) / 2, pixel(482),
+               (width - gap) / 2, pixel(28), TRUE);
+    place(captureStatus_, 516, 42);
+    place(note_, 562, 36);
   }
 
   void refresh() {
@@ -533,6 +651,94 @@ private:
             ? filterActivity(snapshot)
             : nextAction(actionStatus);
     SetWindowTextW(action_, action);
+    refreshCapture(snapshot, available);
+  }
+
+  void refreshCapture(const Diagnostics &snapshot, bool available) {
+    const auto state =
+        available ? snapshot.capture_state : LocalCaptureState::idle;
+    const bool busy = state == LocalCaptureState::preparing ||
+                      state == LocalCaptureState::recording ||
+                      state == LocalCaptureState::appending ||
+                      state == LocalCaptureState::complete ||
+                      state == LocalCaptureState::writing;
+    EnableWindow(capture_, available && !busy);
+    EnableWindow(cancelCapture_, available && busy);
+    std::wstring message;
+    switch (state) {
+    case LocalCaptureState::idle:
+      message =
+          available
+              ? L"Local capture idle. Records only after confirmation."
+              : L"Local capture unavailable while processor is disconnected.";
+      break;
+    case LocalCaptureState::preparing:
+      message = L"Preparing the local diagnostic capture...";
+      break;
+    case LocalCaptureState::recording:
+    case LocalCaptureState::appending: {
+      wchar_t progress[96]{};
+      const auto percent =
+          snapshot.capture_total_frames
+              ? std::min(100u,
+                         static_cast<unsigned>(100.0 * snapshot.capture_frames /
+                                               snapshot.capture_total_frames))
+              : 0;
+      std::swprintf(progress, std::size(progress),
+                    L"Recording next 3 seconds locally... %u%%", percent);
+      message = progress;
+      break;
+    }
+    case LocalCaptureState::complete:
+    case LocalCaptureState::writing:
+      message = L"Saving the local diagnostic files...";
+      break;
+    case LocalCaptureState::saved:
+      message = L"Saved locally. " + localCaptureResult(controller_);
+      break;
+    case LocalCaptureState::cancelled:
+      message = L"Capture cancelled. No diagnostic files saved.";
+      break;
+    case LocalCaptureState::failed:
+      message =
+          L"Capture could not be saved. " + localCaptureResult(controller_);
+      break;
+    }
+    if (!captureMessage_.empty() && state == LocalCaptureState::idle)
+      message = captureMessage_;
+    SetWindowTextW(captureStatus_, message.c_str());
+  }
+
+  void beginCapture() {
+    PWSTR knownFolder = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT,
+                                    nullptr, &knownFolder))) {
+      captureMessage_ = L"Local diagnostic folder is unavailable.";
+      refresh();
+      return;
+    }
+    const std::wstring destination =
+        std::wstring(knownFolder) + L"\\BunCancel\\Diagnostics";
+    CoTaskMemFree(knownFolder);
+    const std::wstring confirmation =
+        L"Record the next 3 seconds of microphone, playback reference and "
+        L"processed output?\r\n\r\n"
+        L"The WAV files may contain voices and other private audio. Choose a "
+        L"moment you are comfortable saving. "
+        L"Files stay on this computer and are never uploaded by "
+        L"BunCancel.\r\n\r\n"
+        L"Save a new capture folder under:\r\n" +
+        destination;
+    if (MessageBoxW(window_, confirmation.c_str(), L"Record local diagnostic?",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES ||
+        !window_)
+      return;
+    captureMessage_.clear();
+    if (!startLocalCapture(controller_, destination))
+      captureMessage_ = L"The processor could not start a local capture.";
+    refreshStatus(controller_);
+    if (window_)
+      refresh();
   }
 
   void edit(ParamID id, ParamValue value) {
@@ -555,12 +761,15 @@ private:
   }
 
   void detachWindow() {
-    if (window_)
+    if (window_) {
+      cancelLocalCapture(controller_);
       DestroyWindow(window_);
+    }
     window_ = nullptr;
     systemWindow = nullptr;
     title_ = subtitle_ = enable_ = sourceLabel_ = endpoint_ = bypass_ =
-        statusLabel_ = status_ = diagnostics_ = action_ = note_ = nullptr;
+        statusLabel_ = status_ = diagnostics_ = action_ = note_ = capture_ =
+            cancelCapture_ = captureStatus_ = nullptr;
     if (font_) {
       DeleteObject(font_);
       font_ = nullptr;
@@ -571,6 +780,7 @@ private:
     }
     statusText_.clear();
     diagnosticsText_.clear();
+    captureMessage_.clear();
   }
 
   static LRESULT CALLBACK windowProcedure(HWND window, UINT message,
@@ -610,7 +820,14 @@ private:
                    SendMessageW(self->bypass_, BM_GETCHECK, 0, 0) == BST_CHECKED
                        ? 1.0
                        : 0.0);
-      else if (id == endpointControlId && notification == CBN_SELCHANGE) {
+      else if (id == captureControlId && notification == BN_CLICKED)
+        self->beginCapture();
+      else if (id == cancelCaptureControlId && notification == BN_CLICKED) {
+        cancelLocalCapture(self->controller_);
+        refreshStatus(self->controller_);
+        if (self->window_)
+          self->refresh();
+      } else if (id == endpointControlId && notification == CBN_SELCHANGE) {
         const auto selected = SendMessageW(self->endpoint_, CB_GETCURSEL, 0, 0);
         if (selected >= 0 && selected <= self->endpointSteps_)
           self->edit(endpointId,
@@ -643,6 +860,7 @@ private:
   HWND sourceLabel_ = nullptr, endpoint_ = nullptr, bypass_ = nullptr;
   HWND statusLabel_ = nullptr, status_ = nullptr, note_ = nullptr;
   HWND diagnostics_ = nullptr, action_ = nullptr;
+  HWND capture_ = nullptr, cancelCapture_ = nullptr, captureStatus_ = nullptr;
   HINSTANCE module_ = nullptr;
   HFONT font_ = nullptr;
   wchar_t className_[80]{};
@@ -651,6 +869,7 @@ private:
   int32 endpointSteps_ = 0;
   std::wstring statusText_;
   std::wstring diagnosticsText_;
+  std::wstring captureMessage_;
 };
 } // namespace
 

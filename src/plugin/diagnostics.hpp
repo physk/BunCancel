@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace Steinberg::Vst {
 class EditController;
@@ -80,6 +81,18 @@ selectProcessingStatus(const ProcessingObservation &value) noexcept {
                         : ProcessingStatus::readyMonitoring;
 }
 
+enum class LocalCaptureState : std::uint32_t {
+  idle,
+  preparing,
+  recording,
+  appending,
+  complete,
+  writing,
+  saved,
+  cancelled,
+  failed
+};
+
 // One observation from one processor callback. Reduction is an observed level
 // change, never an ERLE measurement or proof of near-end voice preservation.
 struct Diagnostics {
@@ -121,6 +134,26 @@ struct Diagnostics {
   float competing_correlation{};
   float filter_mic_rms{};
   float filter_output_rms{};
+  float window_mic_rms{}, window_mic_peak{};
+  float window_output_rms{}, window_output_peak{};
+  float window_reference_rms{}, window_reference_peak{};
+  float window_downmix_rms{}, window_downmix_peak{};
+  double window_mic_seconds{}, window_reference_seconds{};
+  float window_changed_fraction{}, window_usable_fraction{};
+  float window_subtraction_fraction{};
+  double reference_receipt_age_ms{};
+  double mic_activity_age_ms{}, reference_activity_age_ms{};
+  bool window_mic_observed{}, window_reference_observed{};
+  bool reference_receipt_valid{}, mic_activity_valid{},
+      reference_activity_valid{};
+  LocalCaptureState capture_state{LocalCaptureState::idle};
+  std::uint32_t capture_frames{}, capture_total_frames{};
+  std::uint32_t shadow_decision{};
+  float shadow_training_eligibility{}, shadow_validation_eligibility{};
+  float shadow_coherence{}, shadow_mic_error_ratio{},
+      shadow_foreground_error_ratio{};
+  std::uint64_t shadow_validation_count{};
+  float window_mic_active_fraction{}, window_reference_active_fraction{};
   bool shadow_validating{};
   bool dsp_available{};
   bool block_power_delta_valid{};
@@ -139,5 +172,11 @@ struct Diagnostics {
 // UI thread only. False means the connection or observation expired.
 bool readDiagnostics(Steinberg::Vst::EditController *controller,
                      Diagnostics &snapshot);
+
+// Explicit editor controls only. The processor resolves its fixed local folder.
+bool startLocalCapture(Steinberg::Vst::EditController *controller,
+                       const std::wstring &localParent);
+void cancelLocalCapture(Steinberg::Vst::EditController *controller);
+std::wstring localCaptureResult(Steinberg::Vst::EditController *controller);
 
 } // namespace buncancel::plugin

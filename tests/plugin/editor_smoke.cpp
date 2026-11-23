@@ -34,6 +34,8 @@ constexpr ParamID enabledId = 0, endpointId = 1, bypassId = 2, statusId = 3;
 constexpr int enableControlId = 1001, endpointControlId = 1002;
 constexpr int bypassControlId = 1003, statusControlId = 1004;
 constexpr int diagnosticsControlId = 1005, actionControlId = 1006;
+constexpr int captureControlId = 1007, cancelCaptureControlId = 1008;
+constexpr int captureStatusControlId = 1009;
 
 void require(bool value, const char *message) {
   if (!value)
@@ -137,6 +139,7 @@ public:
   explicit DiagnosticPeer(IConnectionPoint *controller)
       : controller_(controller) {}
   buncancel::plugin::Diagnostics observation;
+  unsigned captureRequests = 0, cancelRequests = 0;
   tresult PLUGIN_API queryInterface(const TUID iid, void **object) override {
     *object = nullptr;
     if (FUnknownPrivate::iidEqual(iid, IConnectionPoint::iid) ||
@@ -154,8 +157,23 @@ public:
     return kResultOk;
   }
   tresult PLUGIN_API notify(IMessage *request) override {
-    if (!request || !request->getMessageID() ||
-        std::strcmp(request->getMessageID(), "BunCancel.Status.Request") != 0)
+    if (!request || !request->getMessageID())
+      return kResultFalse;
+    if (std::strcmp(request->getMessageID(), "BunCancel.Capture.Start") == 0) {
+      ++captureRequests;
+      observation.capture_state =
+          buncancel::plugin::LocalCaptureState::recording;
+      observation.capture_frames = 48000;
+      observation.capture_total_frames = 144000;
+      return kResultOk;
+    }
+    if (std::strcmp(request->getMessageID(), "BunCancel.Capture.Cancel") == 0) {
+      ++cancelRequests;
+      observation.capture_state =
+          buncancel::plugin::LocalCaptureState::cancelled;
+      return kResultOk;
+    }
+    if (std::strcmp(request->getMessageID(), "BunCancel.Status.Request") != 0)
       return kResultFalse;
     HostMessage reply;
     reply.setMessageID("BunCancel.Status.Reply");
@@ -163,6 +181,10 @@ public:
                                   static_cast<int64>(observation.status));
     reply.getAttributes()->setBinary("diagnostics.v2", &observation,
                                      sizeof(observation));
+    if (observation.capture_state ==
+        buncancel::plugin::LocalCaptureState::saved)
+      reply.getAttributes()->setString("capture.result",
+                                       STR16("C:\\BunCancelTest\\capture-001"));
     return controller_->notify(&reply);
   }
 
@@ -170,6 +192,49 @@ private:
   IConnectionPoint *controller_;
   uint32 references_ = 1;
 };
+
+int consentResponse = IDNO;
+bool consentShown = false;
+std::wstring consentContents;
+LRESULT CALLBACK consentHook(int code, WPARAM parameter, LPARAM context) {
+  if (code == HCBT_ACTIVATE) {
+    const auto window = reinterpret_cast<HWND>(parameter);
+    std::array<wchar_t, 128> title{};
+    GetWindowTextW(window, title.data(), static_cast<int>(title.size()));
+    if (std::wstring(title.data()) == L"Record local diagnostic?") {
+      consentShown = true;
+      consentContents.clear();
+      EnumChildWindows(
+          window,
+          [](HWND child, LPARAM) -> BOOL {
+            std::array<wchar_t, 4096> label{};
+            GetWindowTextW(child, label.data(), static_cast<int>(label.size()));
+            consentContents += label.data();
+            return TRUE;
+          },
+          0);
+      PostMessageW(window, WM_COMMAND, consentResponse, 0);
+    }
+  }
+  return CallNextHookEx(nullptr, code, parameter, context);
+}
+
+void respondToConsent(HWND capture, int response) {
+  consentResponse = response;
+  consentShown = false;
+  const auto hook =
+      SetWindowsHookExW(WH_CBT, consentHook, nullptr, GetCurrentThreadId());
+  require(hook != nullptr, "cannot install capture consent test hook");
+  SendMessageW(capture, BM_CLICK, 0, 0);
+  UnhookWindowsHookEx(hook);
+  require(consentShown, "capture started without a visible consent dialog");
+  require(consentContents.find(L"next 3 seconds") != std::wstring::npos &&
+              consentContents.find(
+                  L"microphone, playback reference and processed output") !=
+                  std::wstring::npos &&
+              consentContents.find(L"never uploaded") != std::wstring::npos,
+          "capture consent omitted duration, signals or local-only behavior");
+}
 
 void pump() {
   MSG message{};
@@ -348,6 +413,9 @@ void editor(IComponent *component, IEditController *controller,
   const HWND status = findControl(host, statusControlId);
   const HWND diagnostics = findControl(host, diagnosticsControlId);
   const HWND action = findControl(host, actionControlId);
+  const HWND capture = findControl(host, captureControlId);
+  const HWND cancelCapture = findControl(host, cancelCaptureControlId);
+  const HWND captureStatus = findControl(host, captureStatusControlId);
   require(text(enable) == L"Enable experimental AEC", "enable label is wrong");
   require(text(bypass) == L"Bypass (dry microphone)", "bypass label is wrong");
   require(!text(status).empty(), "status label is empty");
@@ -396,7 +464,8 @@ void editor(IComponent *component, IEditController *controller,
   }
   std::cout << "Enumerated playback-reference endpoints: "
             << endpointInfo.stepCount << '\n';
-  for (HWND control : {enable, endpoint, bypass, status, diagnostics, action}) {
+  for (HWND control : {enable, endpoint, bypass, status, diagnostics, action,
+                       capture, cancelCapture, captureStatus}) {
     RECT client{}, bounds{};
     GetClientRect(GetParent(control), &client);
     GetWindowRect(control, &bounds);
@@ -418,6 +487,10 @@ void editor(IComponent *component, IEditController *controller,
   refresh(status);
   require(text(status) == L"Dry - no reference selected",
           "connected processor no-reference status did not reach editor");
+  require(text(captureStatus).find(L"Records only after confirmation") !=
+                  std::wstring::npos &&
+              IsWindowEnabled(capture) && !IsWindowEnabled(cancelCapture),
+          "local diagnostic capture must start idle with explicit consent");
   const auto liveDetails = text(diagnostics);
   require(
       liveDetails.find(L"Mic: RMS -9.4 / peak -5.0 dBFS") !=
@@ -525,6 +598,22 @@ void editor(IComponent *component, IEditController *controller,
   observation.prediction_rms = 0.001f;
   observation.filter_age_ms = 4000;
   observation.block_samples = 256;
+  observation.shadow_decision = 4;
+  observation.shadow_validation_count = 12;
+  observation.shadow_training_eligibility = 0.9f;
+  observation.shadow_validation_eligibility = 0.25f;
+  observation.window_mic_observed = observation.window_reference_observed =
+      true;
+  observation.window_mic_rms = 0.02f;
+  observation.window_output_rms = 0.02f;
+  observation.window_reference_rms = 0.0125f;
+  observation.window_downmix_rms = 0.01f;
+  observation.window_mic_seconds = observation.window_reference_seconds = 3;
+  observation.reference_receipt_valid = observation.mic_activity_valid =
+      observation.reference_activity_valid = true;
+  observation.reference_receipt_age_ms = 5;
+  observation.mic_activity_age_ms = 100;
+  observation.reference_activity_age_ms = 400;
   observation.last_underrun_valid = true;
   observation.last_underrun_age_ms = 1250;
   require(controllerConnection->connect(&diagnosticPeer) == kResultOk,
@@ -536,11 +625,15 @@ void editor(IComponent *component, IEditController *controller,
           "aligned protected filter did not explain absent subtraction");
   const auto stalled = text(diagnostics);
   for (const auto *expected :
-       {L"(mono)", L"changed: 0 of 256", L"Live confidence: 0.700",
+       {L"(mono, last block)", L"changed: 0 of 256", L"Live confidence: 0.700",
         L"Peak correlation: 0.747", L"Active echo lag: 272.00",
         L"Adapted samples: 8000", L"weights L1: 1.0000",
         L"adaptation frozen: 100.0%", L"Filter age: 4.00 s",
-        L"last: 1.25 s ago", L"Prediction RMS:"})
+        L"last underrun: 1.25 s ago", L"Prediction RMS:",
+        L"3 s evidence window", L"Last reference packet received: 0.005 s ago",
+        L"mic 0.10 s ago / ref 0.40 s ago", L"Window downmix RMS/peak:",
+        L"Last candidate outcome: insufficient correlated evidence",
+        L"Validation cycles: 12"})
     require(stalled.find(expected) != std::wstring::npos,
             "detailed stalled-filter observation was omitted");
   require((GetWindowLongW(diagnostics, GWL_STYLE) & ES_READONLY) != 0 &&
@@ -560,6 +653,28 @@ void editor(IComponent *component, IEditController *controller,
               text(diagnostics).find(L"/ +2.50 dB") != std::wstring::npos &&
               SendMessageW(diagnostics, EM_GETFIRSTVISIBLELINE, 0, 0) > 0,
           "actual subtraction was confused with measured reduction");
+  require(diagnosticPeer.captureRequests == 0 &&
+              diagnosticPeer.cancelRequests == 0,
+          "refresh or host observation triggered local capture");
+  respondToConsent(capture, IDNO);
+  require(diagnosticPeer.captureRequests == 0,
+          "declining capture consent still reached processor");
+  respondToConsent(capture, IDYES);
+  require(diagnosticPeer.captureRequests == 1 && !IsWindowEnabled(capture) &&
+              IsWindowEnabled(cancelCapture) &&
+              text(captureStatus).find(L"Recording next 3 seconds locally") !=
+                  std::wstring::npos,
+          "accepted capture did not show active recording and cancellation");
+  SendMessageW(cancelCapture, BM_CLICK, 0, 0);
+  require(diagnosticPeer.cancelRequests == 1 && IsWindowEnabled(capture) &&
+              !IsWindowEnabled(cancelCapture) &&
+              text(captureStatus).find(L"cancelled") != std::wstring::npos,
+          "local capture cancel did not reach processor or update controls");
+  observation.capture_state = buncancel::plugin::LocalCaptureState::saved;
+  refresh(status);
+  require(text(captureStatus).find(L"C:\\BunCancelTest\\capture-001") !=
+              std::wstring::npos,
+          "local capture result folder is inaccessible in editor");
   observation.status = buncancel::plugin::ProcessingStatus::cancelling;
   observation.reducing = true;
   refresh(status);

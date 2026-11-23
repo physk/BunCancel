@@ -14,6 +14,9 @@ inline constexpr int bypassControlId = 1003;
 inline constexpr int statusControlId = 1004;
 inline constexpr int diagnosticsControlId = 1005;
 inline constexpr int actionControlId = 1006;
+inline constexpr int captureControlId = 1007;
+inline constexpr int cancelCaptureControlId = 1008;
+inline constexpr int captureStatusControlId = 1009;
 
 void refreshStatus(Steinberg::Vst::EditController *controller);
 
