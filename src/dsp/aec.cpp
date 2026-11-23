@@ -15,7 +15,10 @@ float bounded(float value) noexcept {
 }
 } // namespace
 
-Aec::Aec(int sampleRate) : sampleRate_(sampleRate), maxDelay_(sampleRate / 3) {
+Aec::Aec(int sampleRate)
+    : sampleRate_(sampleRate), maxDelay_(sampleRate / 3),
+      diagnosticMaxDelay_(sampleRate / 2),
+      diagnosticLookback_(sampleRate / 25) {
   if (sampleRate < 8000 || sampleRate > 192000) {
     throw std::invalid_argument(
         "AEC sample rate must be between 8000 and 192000 Hz");
@@ -37,6 +40,7 @@ Aec::Aec(int sampleRate) : sampleRate_(sampleRate), maxDelay_(sampleRate / 3) {
   microphone_.resize(size);
   weights_.resize(taps_);
   tapValues_.resize(taps_);
+  reset();
 }
 
 void Aec::reset() noexcept {
@@ -49,12 +53,22 @@ void Aec::reset() noexcept {
   bestLag_ = 0;
   delay_ = 0;
   strongCandidates_ = 0;
+  diagnosticScanLag_ = -diagnosticLookback_;
+  diagnosticBestLag_ = 0;
+  diagnosticStrongCandidates_ = 0;
+  diagnosticBestScore_ = 0;
+  diagnosticScanEnd_ = 0;
+  modelDiagnostics_ = {};
+  excludedDiagnostics_ = {};
   lostSamples_ = 0;
   bestScore_ = 0;
   confidence_ = 0;
   micPower_ = 0;
   predictedPower_ = 0;
   crossPower_ = 0;
+  outputPower_ = 0;
+  subtractionPower_ = 0;
+  subtractionCrossPower_ = 0;
   adaptedSamples_ = 0;
   aligned_ = false;
   missing_ = false;
@@ -75,8 +89,10 @@ float Aec::correlation(int lag, std::uint64_t end) const noexcept {
     // First differences reduce low-frequency periodic ambiguity. This is
     // evidence for alignment only, not a modification of the output signal.
     const double m = history(microphone_, t) - history(microphone_, t - 1);
-    const double r =
-        history(reference_, t - lag) - history(reference_, t - lag - 1);
+    const auto referenceTime = lag >= 0 ? t - static_cast<unsigned>(lag)
+                                        : t + static_cast<unsigned>(-lag);
+    const double r = history(reference_, referenceTime) -
+                     history(reference_, referenceTime - 1);
     cross += m * r;
     micEnergy += m * m;
     refEnergy += r * r;
@@ -96,6 +112,9 @@ void Aec::searchDelay() noexcept {
     bestScore_ = 0;
     bestLag_ = 0;
     strongCandidates_ = 0;
+    if (modelDiagnostics_.state == AlignmentState::Warmup) {
+      modelDiagnostics_.state = AlignmentState::Searching;
+    }
   }
   const float score = correlation(scanLag_, scanEnd_);
   if (score > 0.65F) {
@@ -109,6 +128,19 @@ void Aec::searchDelay() noexcept {
     return;
   }
   const float currentScore = aligned_ ? correlation(delay_, scanEnd_) : 0;
+  modelDiagnostics_.peakLagSamples = bestLag_;
+  modelDiagnostics_.peakCorrelation = bestScore_;
+  modelDiagnostics_.peakValid = bestScore_ > 0;
+  modelDiagnostics_.candidateValid = bestScore_ > 0.65F &&
+                                     strongCandidates_ < 2 * taps_ &&
+                                     correlation(bestLag_, time_) > 0.65F;
+  modelDiagnostics_.candidateLagSamples = bestLag_;
+  modelDiagnostics_.state = AlignmentState::InsufficientCorrelation;
+  if (bestScore_ > 0.65F && strongCandidates_ >= 2 * taps_) {
+    modelDiagnostics_.state = AlignmentState::Ambiguous;
+  } else if (modelDiagnostics_.candidateValid && bestLag_ <= 1) {
+    modelDiagnostics_.state = AlignmentState::SelfMonitor;
+  }
   // Require strong observed correlation before ever subtracting a signal.
   // Reacquisition is intentionally conservative during independent near speech.
   if (bestScore_ > 0.65F && strongCandidates_ < 2 * taps_ && bestLag_ > 1 &&
@@ -125,6 +157,79 @@ void Aec::searchDelay() noexcept {
   }
   confidence_ = aligned_ ? correlation(delay_, scanEnd_) : 0;
   scanLag_ = 0;
+}
+
+void Aec::searchExcludedDelay() noexcept {
+  // This independent scan never supplies the cancellation filter. Its older
+  // microphone endpoint permits negative lag observations without lookahead.
+  if (time_ <
+      static_cast<std::uint64_t>(diagnosticMaxDelay_ + correlationSpan_ +
+                                 diagnosticLookback_ + 1)) {
+    return;
+  }
+  if (diagnosticScanLag_ == -diagnosticLookback_) {
+    diagnosticScanEnd_ = time_ - diagnosticLookback_;
+    diagnosticBestScore_ = 0;
+    diagnosticBestLag_ = 0;
+    diagnosticStrongCandidates_ = 0;
+  }
+  const float score = correlation(diagnosticScanLag_, diagnosticScanEnd_);
+  diagnosticStrongCandidates_ += score > 0.65F;
+  if (score > diagnosticBestScore_) {
+    diagnosticBestScore_ = score;
+    diagnosticBestLag_ = diagnosticScanLag_;
+  }
+  ++diagnosticScanLag_;
+  if (diagnosticScanLag_ == 0) {
+    diagnosticScanLag_ = maxDelay_ + 1;
+  }
+  if (diagnosticScanLag_ <= diagnosticMaxDelay_) {
+    return;
+  }
+  excludedDiagnostics_.peakLagSamples = diagnosticBestLag_;
+  excludedDiagnostics_.peakCorrelation = diagnosticBestScore_;
+  excludedDiagnostics_.peakValid = diagnosticBestScore_ > 0;
+  excludedDiagnostics_.candidateLagSamples = diagnosticBestLag_;
+  excludedDiagnostics_.candidateValid =
+      diagnosticBestScore_ > 0.65F && diagnosticStrongCandidates_ < 2 * taps_ &&
+      correlation(diagnosticBestLag_, time_ - diagnosticLookback_) > 0.65F;
+  diagnosticScanLag_ = -diagnosticLookback_;
+}
+
+Aec::Diagnostics Aec::diagnostics() const noexcept {
+  auto result = modelDiagnostics_;
+  if (excludedDiagnostics_.peakValid &&
+      excludedDiagnostics_.peakCorrelation > result.peakCorrelation) {
+    result.peakLagSamples = excludedDiagnostics_.peakLagSamples;
+    result.peakCorrelation = excludedDiagnostics_.peakCorrelation;
+    result.peakValid = true;
+  }
+  if (excludedDiagnostics_.candidateValid &&
+      !modelDiagnostics_.candidateValid &&
+      modelDiagnostics_.state != AlignmentState::Ambiguous) {
+    result.state = AlignmentState::DelayOutOfRange;
+    result.candidateLagSamples = excludedDiagnostics_.candidateLagSamples;
+    result.candidateValid = true;
+  }
+  if (aligned_) {
+    result.state = AlignmentState::Aligned;
+    result.candidateLagSamples = delay_;
+    result.candidateValid = true;
+    const double coherence = subtractionCrossPower_ * subtractionCrossPower_ /
+                             (micPower_ * subtractionPower_ + 1.0e-20);
+    if (history(microphone_, time_ - 1) != 0 && confidence_ >= 0.2F &&
+        subtractionPower_ > 1.0e-10 && subtractionCrossPower_ > 0 &&
+        coherence > 0.25 && outputPower_ < micPower_ * 0.977 &&
+        adaptedSamples_ >= 2048) {
+      result.reductionDb = static_cast<float>(
+          10 * std::log10(micPower_ / (outputPower_ + 1.0e-20)));
+      result.reductionValid = true;
+    }
+  }
+  if (missing_) {
+    result.state = AlignmentState::ReferenceMissing;
+  }
+  return result;
 }
 
 void Aec::process(const float *mic, const float *reference, float *out,
@@ -149,6 +254,7 @@ void Aec::process(const float *mic, const float *reference, float *out,
     reference_[static_cast<std::size_t>(time_ & historyMask_)] = r;
     microphone_[static_cast<std::size_t>(time_ & historyMask_)] = m;
     searchDelay();
+    searchExcludedDelay();
     if (aligned_ && (time_ & 255U) == 0) {
       confidence_ = correlation(delay_, time_);
       lostSamples_ = confidence_ < 0.2F ? lostSamples_ + 256 : 0;
@@ -183,7 +289,7 @@ void Aec::process(const float *mic, const float *reference, float *out,
         adaptedSamples_ <
         static_cast<std::uint64_t>(std::max(sampleRate_ / 10, 2048));
     const bool doubleTalk = warming ? confidence_ < 0.65F : coherence < 0.98;
-    if (aligned_ && energy > 1.0e-8F && !doubleTalk) {
+    if (aligned_ && m != 0 && energy > 1.0e-8F && !doubleTalk) {
       // A fixed regularizer limits corrections in reference envelope gaps,
       // where unmodeled long-tail echo otherwise drives huge coefficients.
       const float step = 0.15F * error / (energy + 0.01F);
@@ -212,7 +318,16 @@ void Aec::process(const float *mic, const float *reference, float *out,
         std::clamp(crossPower_ / (predictedPower_ + 1.0e-12), 0.0, 1.0));
     // A stale model must not amplify interference. Constrained regression
     // decreases cancellation when its prediction ceases to explain the mic.
-    out[i] = bounded(m - subtractionGain * prediction);
+    // An unflagged digital microphone mute must not turn the learned echo
+    // model into an audio source. Exact zero needs no level threshold that
+    // could gate quiet near-end speech.
+    out[i] = m == 0 ? 0 : bounded(m - subtractionGain * prediction);
+    const double subtraction = static_cast<double>(m) - out[i];
+    outputPower_ = smoothing * outputPower_ + (1 - smoothing) * out[i] * out[i];
+    subtractionPower_ = smoothing * subtractionPower_ +
+                        (1 - smoothing) * subtraction * subtraction;
+    subtractionCrossPower_ =
+        smoothing * subtractionCrossPower_ + (1 - smoothing) * m * subtraction;
     ++time_;
   }
 }

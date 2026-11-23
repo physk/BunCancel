@@ -231,8 +231,10 @@ void sampleRatesAndAllocation() {
     allocations = 0;
     countAllocations = true;
     engine.process(mic.data(), reference.data(), output.data(), count);
+    const auto diagnostics = engine.diagnostics();
     countAllocations = false;
     require(allocations == 0, "process allocated memory");
+    require(diagnostics.candidateValid, "aligned candidate was unavailable");
     require(engine.aligned() && engine.delaySamples() == delay,
             "sample rate matrix alignment failed");
     require(energy(output, rate * 3 / 2, count) <
@@ -309,6 +311,151 @@ void modulatedHarmonicDoubleTalk() {
             "harmonic double talk amplified interference");
   }
 }
+
+void acquisitionDiagnostics() {
+  using State = buncancel::Aec::AlignmentState;
+  constexpr int rate = 8000;
+  constexpr int count = rate * 2;
+  const auto reference = noise(count, 107);
+  std::vector<float> mic(count);
+  std::vector<float> output(count);
+  buncancel::Aec engine(rate);
+  require(engine.diagnostics().state == State::Warmup,
+          "new engine did not report warmup");
+  engine.process(reference.data(), reference.data(), output.data(), rate / 2);
+  require(engine.diagnostics().state == State::Warmup,
+          "history accumulation was misreported as failed correlation");
+  engine.process(reference.data() + rate / 2, reference.data() + rate / 2,
+                 output.data() + rate / 2, rate / 5);
+  require(engine.diagnostics().state == State::Searching,
+          "first unfinished scan was misreported as failed correlation");
+
+  for (const int delay : {-80, rate * 9 / 20}) {
+    for (int i = 0; i < count; ++i) {
+      const int source = i - delay;
+      mic[i] = source >= 0 && source < count ? reference[source] * 0.7F : 0;
+    }
+    engine.reset();
+    engine.process(mic.data(), reference.data(), output.data(), count);
+    const auto diagnostics = engine.diagnostics();
+    require(!engine.aligned() && output == mic,
+            "excluded delay modified the dry microphone");
+    require(diagnostics.state == State::DelayOutOfRange &&
+                diagnostics.candidateValid && diagnostics.peakValid &&
+                diagnostics.candidateLagSamples == delay &&
+                diagnostics.peakLagSamples == delay &&
+                diagnostics.peakCorrelation > 0.99F,
+            "confirmed excluded delay was not reported accurately");
+  }
+
+  mic = noise(count, 109);
+  engine.reset();
+  engine.process(mic.data(), reference.data(), output.data(), count);
+  auto diagnostics = engine.diagnostics();
+  require(diagnostics.state == State::InsufficientCorrelation &&
+              !diagnostics.candidateValid && diagnostics.peakValid &&
+              diagnostics.peakLagSamples != 0 && !diagnostics.reductionValid,
+          "weak correlation was mislabeled as excluded delay or reduction");
+  require(output == mic, "unrelated reference modified the microphone");
+
+  engine.reset();
+  engine.process(reference.data(), reference.data(), output.data(), count);
+  diagnostics = engine.diagnostics();
+  require(diagnostics.state == State::SelfMonitor &&
+              diagnostics.candidateValid &&
+              diagnostics.candidateLagSamples == 0,
+          "direct self-monitoring was not diagnosed");
+  std::vector<float> tone(count);
+  for (int i = 0; i < count; ++i) {
+    tone[i] =
+        static_cast<float>(0.2 * std::sin(i * 2 * 3.141592653589793 / 32));
+    mic[i] = i >= 200 ? tone[i - 200] * 0.7F : 0;
+  }
+  engine.reset();
+  engine.process(mic.data(), tone.data(), output.data(), count);
+  require(engine.diagnostics().state == State::Ambiguous && output == mic,
+          "periodic ambiguity was not diagnosed safely");
+  engine.process(mic.data(), nullptr, output.data(), count);
+  diagnostics = engine.diagnostics();
+  require(diagnostics.state == State::ReferenceMissing &&
+              !diagnostics.candidateValid && !diagnostics.peakValid &&
+              !diagnostics.reductionValid,
+          "reference loss retained stale diagnostic evidence");
+}
+
+void echoDisappearance() {
+  constexpr int rate = 8000;
+  constexpr int count = rate * 4;
+  constexpr int delay = 211;
+  const auto reference = noise(count, 19);
+  const auto near = noise(count, 29);
+  std::vector<float> mic(count);
+  std::vector<float> output(count);
+  for (int i = 0; i < count; ++i) {
+    mic[i] =
+        i < rate * 2 ? (i >= delay ? reference[i - delay] * 0.6F : 0) : near[i];
+  }
+  buncancel::Aec engine(rate);
+  engine.process(mic.data(), reference.data(), output.data(), rate * 2);
+  auto diagnostics = engine.diagnostics();
+  require(diagnostics.reductionValid && diagnostics.reductionDb > 20,
+          "converged coherent subtraction lacked reduction evidence");
+  engine.process(mic.data() + rate * 2, reference.data() + rate * 2,
+                 output.data() + rate * 2, rate / 5);
+  require(!engine.diagnostics().reductionValid,
+          "echo disappearance retained stale reduction evidence");
+  engine.process(mic.data() + rate * 11 / 5, reference.data() + rate * 11 / 5,
+                 output.data() + rate * 11 / 5, count - rate * 11 / 5);
+  double error = 0;
+  double cross = 0;
+  for (int i = rate * 2; i < count; ++i) {
+    error += std::pow(output[i] - near[i], 2);
+    cross += static_cast<double>(output[i]) * near[i];
+  }
+  const double nearEnergy = energy(near, rate * 2, count);
+  require(error < nearEnergy * 0.025 && cross / nearEnergy > 0.98,
+          "disappearing echo injected interference or damaged near voice");
+  require(std::equal(output.begin() + rate * 3, output.end(),
+                     mic.begin() + rate * 3),
+          "echo disappearance did not recover dry microphone");
+  require(!engine.diagnostics().reductionValid,
+          "dry microphone claimed ongoing reduction");
+}
+
+void trainedMicrophoneMute() {
+  constexpr int rate = 8000;
+  constexpr int count = rate * 3;
+  constexpr int delay = 211;
+  const auto reference = noise(count, 127);
+  const auto near = noise(count, 131);
+  std::vector<float> mic(count);
+  std::vector<float> output(count);
+  for (int i = delay; i < rate * 2; ++i) {
+    mic[i] = reference[i - delay] * 0.7F;
+  }
+  buncancel::Aec engine(rate);
+  engine.process(mic.data(), reference.data(), output.data(), rate * 2);
+  require(engine.aligned() && engine.diagnostics().reductionValid,
+          "microphone mute test did not train its echo model");
+  for (const int block : {1, 31, 128, 2048}) {
+    const int start = rate * 2;
+    engine.process(mic.data() + start, reference.data() + start,
+                   output.data() + start, block);
+    require(std::all_of(output.begin() + start, output.begin() + start + block,
+                        [](float sample) { return sample == 0; }),
+            "trained echo model emitted audio into digitally muted mic");
+    require(!engine.diagnostics().reductionValid,
+            "digitally muted microphone claimed current reduction");
+  }
+
+  // A quiet, nonzero microphone is a distinct signal, not a digital mute.
+  engine.reset();
+  for (int i = 0; i < count; ++i) {
+    mic[i] = near[i] * 1.0e-5F;
+  }
+  engine.process(mic.data(), reference.data(), output.data(), count);
+  require(output == mic, "digital mute protection gated quiet near speech");
+}
 } // namespace
 
 int main() {
@@ -320,6 +467,9 @@ int main() {
     unusableAlignment();
     sampleRatesAndAllocation();
     modulatedHarmonicDoubleTalk();
+    acquisitionDiagnostics();
+    echoDisappearance();
+    trainedMicrophoneMute();
     std::cout << "AEC deterministic regression checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << "AEC regression failed: " << error.what() << '\n';

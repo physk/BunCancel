@@ -18,6 +18,31 @@ namespace buncancel {
 // reference.
 class Aec {
 public:
+  enum class AlignmentState {
+    Warmup,
+    Searching,
+    InsufficientCorrelation,
+    Ambiguous,
+    SelfMonitor,
+    DelayOutOfRange,
+    Aligned,
+    ReferenceMissing
+  };
+  struct Diagnostics {
+    AlignmentState state = AlignmentState::Warmup;
+    // Latest completed search peaks include weak matches. candidateValid
+    // additionally requires a strong, unambiguous match on newer audio.
+    // Signed lags use the same reference/microphone clock as process().
+    int peakLagSamples = 0;
+    float peakCorrelation = 0;
+    bool peakValid = false;
+    int candidateLagSamples = 0;
+    bool candidateValid = false;
+    // Rolling mic/output power reduction with coherent subtraction evidence.
+    // This is not ERLE and cannot distinguish near-end speech from echo.
+    float reductionDb = 0;
+    bool reductionValid = false;
+  };
   explicit Aec(int sampleRate);
   void process(const float *mic, const float *reference, float *out,
                int count) noexcept;
@@ -28,6 +53,10 @@ public:
     return confidence_;
   }
   [[nodiscard]] int latencySamples() const noexcept { return 0; }
+  [[nodiscard]] int maxDelaySamples() const noexcept { return maxDelay_; }
+  // Diagnostic-only excluded-delay search covers [-40 ms, 0) and
+  // (maxDelaySamples(), 500 ms]. It never changes the cancellation lag.
+  [[nodiscard]] Diagnostics diagnostics() const noexcept;
 
 private:
   static constexpr int taps_ = 128;
@@ -38,10 +67,13 @@ private:
                 std::uint64_t time) const noexcept;
   float correlation(int lag, std::uint64_t end) const noexcept;
   void searchDelay() noexcept;
+  void searchExcludedDelay() noexcept;
 
   std::size_t historyMask_ = 0;
   int sampleRate_;
   int maxDelay_;
+  int diagnosticMaxDelay_;
+  int diagnosticLookback_;
   std::vector<float> reference_;
   std::vector<float> microphone_;
   std::vector<float> weights_;
@@ -52,9 +84,19 @@ private:
   int bestLag_ = 0;
   int delay_ = 0;
   int strongCandidates_ = 0;
+  int diagnosticScanLag_ = 0;
+  int diagnosticBestLag_ = 0;
+  int diagnosticStrongCandidates_ = 0;
   int lostSamples_ = 0;
   float bestScore_ = 0;
   float confidence_ = 0;
+  float diagnosticBestScore_ = 0;
+  std::uint64_t diagnosticScanEnd_ = 0;
+  Diagnostics modelDiagnostics_;
+  Diagnostics excludedDiagnostics_;
+  double outputPower_ = 0;
+  double subtractionPower_ = 0;
+  double subtractionCrossPower_ = 0;
   double micPower_ = 0;
   double predictedPower_ = 0;
   double crossPower_ = 0;
