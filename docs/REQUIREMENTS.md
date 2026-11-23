@@ -16,8 +16,10 @@ Requirements are marked MUST, SHOULD, or LATER. They are design requirements unl
 - Estimate relative delay and track slow timing drift between playback reference and microphone capture.
 - Model a finite acoustic path (gain, spectral coloration and reflections), including nonstationary paths.
 - Implement original adaptive echo estimation, near-end/double-talk safeguards and bounded residual echo suppression.
+- A valid reference stream makes an enabled processor ready to monitor. Playback silence, a muted mic and independent near-end speech are normal operating conditions. AEC must start and pass microphone samples without acoustic calibration or audible leakage.
+- Show current subtraction activity separately from capture readiness. Only indicate cancellation when aligned subtraction is reducing measured signal energy. Distinguish measured silence from unavailable samples.
 - Preserve near-end speech; never optimize only for output silence.
-- On no-reference, silence, crash, or unusable alignment, pass through the mic reliably and display a degraded status.
+- Pass through the mic when a reference is missing, interrupted or unusable. Show the connection or processing fault when one is observed. A connected silent reference remains ready.
 - Protect against extreme reference level, clipping and nonlinear loudspeaker/headphone distortion. Document the limits honestly.
 - Do not assert exact or complete cancellation in any acoustic setup.
 
@@ -50,7 +52,7 @@ Requirements are marked MUST, SHOULD, or LATER. They are design requirements unl
 
 ## R6 — Privacy, legal and maintenance (MUST)
 
-- Local processing only by default. No telemetry, automatic uploads or recording retention.
+- Keep signal processing and diagnostics local. Default operation retains only bounded processing history and aggregate meter readings. Saving audio requires explicit consent for each short diagnostic capture. Never automate recording through a saved setting or upload recordings.
 - All media assets must be created in the project or carry a redistributable license and attribution.
 - Original AEC code only; do not copy or relicense another AEC engine as original work.
 - Third-party dependencies and SDK licenses require per-version review.

@@ -1,0 +1,17 @@
+add_library(buncancel-capture STATIC reference_capture.cpp ../reference_timeline.cpp)
+target_include_directories(buncancel-capture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_compile_features(buncancel-capture PUBLIC cxx_std_20)
+set_target_properties(buncancel-capture PROPERTIES POSITION_INDEPENDENT_CODE ON)
+find_package(Threads REQUIRED)
+target_link_libraries(buncancel-capture PRIVATE Threads::Threads)
+if(WIN32)
+  target_compile_definitions(buncancel-capture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(buncancel-capture PRIVATE ole32 uuid propsys)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(buncancel-capture-tests
+    ${PROJECT_SOURCE_DIR}/tests/capture/capture_tests.cpp)
+  target_link_libraries(buncancel-capture-tests PRIVATE buncancel-capture Threads::Threads)
+  add_test(NAME capture-contract COMMAND buncancel-capture-tests)
+endif()

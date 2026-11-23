@@ -5,15 +5,15 @@
 - [x] Original logo asset and license
 - [x] Synthetic WAV generator and standard-library fixture smoke tests
 - [ ] Independently verified licensed real speech corpus and path IRs
-- [ ] Offline scoring tool with rigorously defined temporal alignment and metrics
+- [x] Offline scoring tool with rigorously defined temporal alignment and metrics
 - [ ] Held-out evaluation split, reproducible A/B artifact report
 
 **Exit:** seed-stable WAVs, manifest and metrics, CI that does not confuse fixture tests with AEC performance.
 
 ## M1 — Engine skeleton and baseline
-- [ ] Portable C++20 DSP library with sample format/host-neutral I/O
-- [ ] Deterministic offline processing CLI for existing WAV fixtures
-- [ ] Unit-tested passthrough, delay estimator, finite-tap baseline adaptive filter
+- [x] Portable C++20 DSP library with sample format/host-neutral I/O
+- [x] Deterministic offline processing CLI for existing WAV fixtures
+- [x] Unit-tested passthrough, delay estimator, finite-tap baseline adaptive filter
 - [ ] NaN/denormal/clipping protection and performance instrumentation
 
 **Exit:** measurable initial echo attenuation on the baseline case with separately reported voice distortion.

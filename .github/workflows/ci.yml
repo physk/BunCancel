@@ -1,29 +1,31 @@
-name: Test lab bootstrap
-
-on:
-  push:
-  pull_request:
+name: Portable engine and synthetic lab
+on: [push, pull_request]
 
 jobs:
-  fixture-tests:
-    name: Deterministic WAV fixture checks
-    runs-on: ubuntu-latest
+  offline:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Validate fixtures
-        run: python -m unittest discover -s tests/audio -p "test_*.py" -v
-      - name: Generate sample corpus
-        run: python tests/audio/generate_fixtures.py --out build/fixtures --seconds 2.0
-      - name: Validate neutral project files
-        run: python tools/check_public_docs.py
-      - name: Upload synthetic corpus for inspection
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --config Release --parallel
+      - run: ctest --test-dir build -C Release --output-on-failure
+        env:
+          BUNCANCEL_FIELD_EXPORT: ${{ github.workspace }}/build/field-audio
+      - run: python -m unittest discover -s tests/audio -p "test_*.py" -v
+      - run: python tools/check_public_docs.py
+      - if: runner.os == 'Linux'
+        run: python tools/run_lab.py --runner build/buncancel-offline --out build/evaluation
+      - if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: synthetic-audio-fixtures
-          path: build/fixtures/
+          name: development-audio-and-metrics
+          path: |
+            build/evaluation/
+            build/field-audio/
           retention-days: 7

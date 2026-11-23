@@ -23,3 +23,7 @@ for path in TRACKED_DOCS:
         if pattern.search(text):
             raise SystemExit(f"Attribution/path leak in {path.relative_to(ROOT)}: {pattern.pattern}")
 print(f"Checked {len(TRACKED_DOCS)} public documentation files.")
+
+factory = (ROOT / "src/plugin/plugin.cpp").read_text(encoding="utf-8")
+if not re.search(r'BEGIN_FACTORY_DEF\(\s*"BunCancel"\s*,\s*""\s*,\s*""\s*\)', factory):
+    raise SystemExit("Plugin factory must use the project name and empty contact fields.")

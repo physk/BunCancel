@@ -6,11 +6,11 @@ BunCancel is an experimental, free and open-source Windows VST3 acoustic echo ca
 
 The first target is gaming and voice chat: play a friend's voice through headphones, even close to the microphone, without sending that voice back through the mic feed. The initial reference scenario is **Wave Link 3 Personal Mix → BunCancel reference capture → microphone VST3 processing → clean microphone output**. Other audio devices and routing software are first-class targets.
 
-> **Status: design and reproducible test-lab bootstrap. No working AEC implementation or verified cancellation claims yet.** Do not advertise the plugin as ready for calls until the real-time host and acoustic tests pass.
+> **Experimental.** The portable engine processes WAV files and the development lab measures the result. The Windows plugin requires host and physical audio qualification before use on calls.
 
 ![BunCancel logo](assets/logo.svg)
 
-## What it does
+## Product goals
 
 - Uses a clean render/playback feed as the **far-end reference**; it is never mixed into the mic output.
 - Learns acoustic transfer paths, playback-to-microphone delay and changing room/headphone conditions.
@@ -32,15 +32,31 @@ The first target is gaming and voice chat: play a friend's voice through headpho
 | [Roadmap](docs/ROADMAP.md) | Delivery sequence and definition of done |
 | [Agent instructions](AGENTS.md) | Rules for coding agents and maintainers |
 
-## Getting started with the test lab
+## Run the offline engine
 
-Requires Python 3.10+; the initial fixture generator uses only the standard library.
+Use CMake 3.20+, a C++20 compiler and Python 3.10+. From the repository root on Linux:
 
-1. Run: **python tests/audio/generate_fixtures.py --out build/fixtures**
-2. Inspect the WAV files in each scenario directory: **reference.wav**, **mic_input.wav**, **clean_voice.wav** and **echo_only.wav**.
-3. Run: **python -m unittest discover -s tests/audio -p "test_*.py" -v**
+```sh
+cmake -S . -B build/linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build/linux --parallel
+ctest --test-dir build/linux --output-on-failure
+python3 -m unittest discover -s tests/audio -v
+python3 tools/run_lab.py --runner build/linux/buncancel-offline --out build/evaluation
+```
 
-The audio is synthetic and deterministic. It is useful for CI, isolation and algorithm debugging, but **must not be mistaken for a representative real speech corpus**. Publicly redistributable clean speech and measured acoustic impulse responses will be added with documented provenance and licenses. Do not commit captures of private conversations.
+Listen to `mic_input.wav` and `processed.wav` in the same scenario directory. Compare them with the isolated `clean_voice.wav` and `echo_only.wav`. The lab writes paired scores and timing diagnostics to `build/evaluation/metrics.json`. To process your own equal-rate, equal-length pair:
+
+```sh
+build/linux/buncancel-offline reference.wav mic.wav processed.wav 256
+```
+
+The optional independent comparison uses the system SpeexDSP shared library only in a separate offline process:
+
+```sh
+python3 tools/compare_speex.py build/evaluation
+```
+
+See [development measurements](docs/BASELINE.md) for results and failure cases and [experimental Windows VST3](docs/VST3.md) for host/build constraints.
 
 ## Design principles
 
@@ -52,12 +68,8 @@ The audio is synthetic and deterministic. It is useful for CI, isolation and alg
 
 ## Roadmap
 
-First: establish deterministic test fixtures and offline evaluation; then build a reference-capture proof of concept and a minimal VST3 shell. Next implement and validate the echo estimator and double-talk behavior. Finally test Wave Link 3 with actual wireless headphones against both simulated and physical acoustic paths.
-
-See [Roadmap](docs/ROADMAP.md) for detailed gates.
+Physical Wave Link and wireless-headphone qualification, independent speech recordings, clock reconciliation and longer acoustic paths remain open. See the [roadmap](docs/ROADMAP.md) for the acceptance gates.
 
 ## Building and contributing
-
-The planned implementation uses **C++20, CMake and the Steinberg VST3 SDK** (subject to review of the exact SDK version and its license). Windows/WASAPI integration will be isolated from portable DSP code. No third-party AEC engine will be embedded or forked. Builds and dependencies should be pinned and reproducible.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). This repository is available under the [MIT license](LICENSE) for original project-authored material; dependencies retain their own licenses.
