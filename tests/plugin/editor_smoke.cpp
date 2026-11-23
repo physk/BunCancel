@@ -495,9 +495,11 @@ int main(int argc, char **argv) {
     require(controller->setComponentHandler(&handler) == kResultOk,
             "component handler setup failed");
     dryProcessor(component, processor, controller);
-    HWND host = CreateWindowExW(
-        0, L"STATIC", L"BunCancel smoke host", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        0, 0, 32, 32, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    // A captioned top-level window has a system minimum tracking width.
+    // Use a borderless host to exercise an actual 32-pixel client rectangle.
+    HWND host = CreateWindowExW(0, L"STATIC", L"BunCancel smoke host",
+                                WS_POPUP | WS_VISIBLE, 0, 0, 32, 32, nullptr,
+                                nullptr, GetModuleHandleW(nullptr), nullptr);
     require(host != nullptr, "host window creation failed");
     editor(component, controller, handler, host, controllerConnection,
            processorConnection);
