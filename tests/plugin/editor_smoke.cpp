@@ -37,6 +37,41 @@ void require(bool value, const char *message) {
     throw std::runtime_error(message);
 }
 
+class Frame final : public IPlugFrame {
+public:
+  explicit Frame(HWND host) : host_(host) {}
+  unsigned resizeRequests = 0;
+  tresult PLUGIN_API queryInterface(const TUID iid, void **object) override {
+    *object = nullptr;
+    if (FUnknownPrivate::iidEqual(iid, IPlugFrame::iid) ||
+        FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+      *object = static_cast<IPlugFrame *>(this);
+      addRef();
+      return kResultOk;
+    }
+    return kNoInterface;
+  }
+  uint32 PLUGIN_API addRef() override { return ++references_; }
+  uint32 PLUGIN_API release() override { return --references_; }
+  tresult PLUGIN_API resizeView(IPlugView *view, ViewRect *size) override {
+    if (!view || !size || size->getWidth() <= 0 || size->getHeight() <= 0)
+      return kInvalidArgument;
+    RECT outer{0, 0, size->getWidth(), size->getHeight()};
+    if (!AdjustWindowRectEx(&outer, GetWindowLongW(host_, GWL_STYLE), FALSE,
+                            GetWindowLongW(host_, GWL_EXSTYLE)) ||
+        !SetWindowPos(host_, nullptr, 0, 0, outer.right - outer.left,
+                      outer.bottom - outer.top,
+                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
+      return kResultFalse;
+    ++resizeRequests;
+    return view->onSize(size);
+  }
+
+private:
+  HWND host_;
+  uint32 references_ = 1;
+};
+
 class Handler final : public IComponentHandler {
 public:
   struct Event {
@@ -211,8 +246,8 @@ void dryProcessor(IComponent *component, IAudioProcessor *processor,
           "processor state did not preserve dry configuration");
 }
 
-void editor(IEditController *controller, Handler &handler, HWND host,
-            IConnectionPoint *controllerConnection,
+void editor(IComponent *component, IEditController *controller,
+            Handler &handler, HWND host, IConnectionPoint *controllerConnection,
             IConnectionPoint *processorConnection) {
   auto *view = controller->createView(ViewType::kEditor);
   require(view != nullptr, "createView(editor) returned null");
@@ -222,8 +257,24 @@ void editor(IEditController *controller, Handler &handler, HWND host,
   require(view->getSize(&size) == kResultOk && size.getWidth() >= 560 &&
               size.getHeight() >= 380,
           "editor returned invalid initial size");
+  Frame frame(host);
+  RECT initialHost{};
+  GetClientRect(host, &initialHost);
+  require(initialHost.right < 100 && initialHost.bottom < 100,
+          "regression host must start too small for the editor");
+  ViewRect tiny(0, 0, 32, 32);
+  require(view->onSize(&tiny) == kResultOk &&
+              view->setFrame(&frame) == kResultOk,
+          "tiny host/frame setup failed");
   require(view->attached(host, kPlatformTypeHWND) == kResultOk,
           "editor attach failed");
+  RECT resizedHost{};
+  GetClientRect(host, &resizedHost);
+  require(frame.resizeRequests > 0 && resizedHost.right >= 560 &&
+              resizedHost.bottom >= 380 && view->getSize(&size) == kResultOk &&
+              size.getWidth() == resizedHost.right &&
+              size.getHeight() == resizedHost.bottom,
+          "editor did not request and honor a readable host size");
   pump();
   const HWND enable = findControl(host, enableControlId);
   const HWND endpoint = findControl(host, endpointControlId);
@@ -316,6 +367,26 @@ void editor(IEditController *controller, Handler &handler, HWND host,
                MAKEWPARAM(endpointControlId, CBN_SELCHANGE),
                reinterpret_cast<LPARAM>(endpoint));
   handler.expect(endpointId, 0);
+  const int savedSelection = endpointInfo.stepCount > 0 ? 1 : 0;
+  const double savedValue =
+      endpointInfo.stepCount > 0 ? 1.0 / endpointInfo.stepCount : 0.0;
+  SendMessageW(endpoint, CB_SETCURSEL, savedSelection, 0);
+  SendMessageW(GetParent(endpoint), WM_COMMAND,
+               MAKEWPARAM(endpointControlId, CBN_SELCHANGE),
+               reinterpret_cast<LPARAM>(endpoint));
+  handler.expect(endpointId, savedValue);
+  MemoryStream saved;
+  require(component->getState(&saved) == kResultOk,
+          "cannot save selected endpoint while bypassed");
+  require(controller->setParamNormalized(endpointId, 0) == kResultOk,
+          "cannot clear controller endpoint before restore");
+  saved.seek(0, IBStream::kIBSeekSet, nullptr);
+  require(controller->setComponentState(&saved) == kResultOk &&
+              controller->getParamNormalized(endpointId) == savedValue,
+          "saved real endpoint selection did not survive component restore");
+  refresh(status);
+  require(SendMessageW(endpoint, CB_GETCURSEL, 0, 0) == savedSelection,
+          "restored endpoint selection is not visible");
 
   refresh(status);
   require(text(status) == L"Dry - AEC off or bypassed",
@@ -330,7 +401,7 @@ void editor(IEditController *controller, Handler &handler, HWND host,
                   kResultOk,
           "status disconnect failed");
   refresh(status);
-  require(text(status) == L"Status unavailable - processor disconnected",
+  require(text(status) == L"Status unavailable - waiting for processor",
           "disconnected processor retained a misleading status");
   require(processorConnection->connect(controllerConnection) == kResultOk &&
               controllerConnection->connect(processorConnection) == kResultOk,
@@ -339,11 +410,13 @@ void editor(IEditController *controller, Handler &handler, HWND host,
   require(text(status) == L"Dry - AEC off or bypassed",
           "status did not recover after reconnect");
   require(view->removed() == kResultOk, "editor detach failed");
+  view->setFrame(nullptr);
   view->release();
   require(GetWindow(host, GW_CHILD) == nullptr,
           "detach leaked native controls");
   view = controller->createView(ViewType::kEditor);
-  require(view && view->attached(host, kPlatformTypeHWND) == kResultOk,
+  require(view && view->setFrame(&frame) == kResultOk &&
+              view->attached(host, kPlatformTypeHWND) == kResultOk,
           "editor reopen failed");
   pump();
   require(SendMessageW(findControl(host, enableControlId), BM_GETCHECK, 0, 0) ==
@@ -351,8 +424,12 @@ void editor(IEditController *controller, Handler &handler, HWND host,
               SendMessageW(findControl(host, bypassControlId), BM_GETCHECK, 0,
                            0) == BST_CHECKED,
           "editor reopen lost controller state");
+  require(SendMessageW(findControl(host, endpointControlId), CB_GETCURSEL, 0,
+                       0) == savedSelection,
+          "editor reopen lost restored endpoint selection");
   require(handler.events.empty(), "host updates/reopen emitted user gestures");
   require(view->removed() == kResultOk, "reopened editor detach failed");
+  view->setFrame(nullptr);
   view->release();
 }
 } // namespace
@@ -420,9 +497,9 @@ int main(int argc, char **argv) {
     dryProcessor(component, processor, controller);
     HWND host = CreateWindowExW(
         0, L"STATIC", L"BunCancel smoke host", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        0, 0, 900, 600, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        0, 0, 32, 32, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     require(host != nullptr, "host window creation failed");
-    editor(controller, handler, host, controllerConnection,
+    editor(component, controller, handler, host, controllerConnection,
            processorConnection);
     DestroyWindow(host);
     const auto stopped = processor->setProcessing(false);
