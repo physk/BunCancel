@@ -506,8 +506,85 @@ void postAlignmentLearning() {
               dry.filterResetCount > resets &&
               dry.samplesSinceReset == static_cast<unsigned>(rate / 10) &&
               dry.adaptedSamples == 0 && dry.weightsNorm == 0 &&
-              dry.predictionRms == 0 && !dry.subtractionActive,
+              dry.predictionRms == 0 && !dry.subtractionActive &&
+              dry.shadowValidationCount == 0 &&
+              dry.shadowDecision ==
+                  buncancel::Aec::ShadowDecision::waitingAlignment,
           "reference loss retained a learned or active filter");
+}
+
+void quietReferenceEvidence() {
+  constexpr int rate = 48000;
+  constexpr int count = rate * 5;
+  constexpr int delay = 12096; // 252 ms DSP lag plus 20 ms reference holdback.
+  auto reference = noise(count, 1739);
+  const auto independent = noise(count, 9157);
+  const float targetRms = std::pow(10.0F, -74.7F / 20);
+  const float scale =
+      targetRms /
+      static_cast<float>(std::sqrt(energy(reference, 0, count) / count));
+  for (auto &sample : reference)
+    sample *= scale;
+  std::vector<float> mic(count), output(count);
+  for (int i = delay; i < count; ++i)
+    mic[i] = reference[i - delay] * 0.7F;
+  buncancel::Aec correlated(rate);
+  correlated.process(mic.data(), reference.data(), output.data(), count);
+  const auto valid = correlated.diagnostics();
+  require(correlated.aligned() && correlated.delaySamples() == delay &&
+              energy(output, rate * 4, count) <
+                  energy(mic, rate * 4, count) * 0.01,
+          "quiet but correlated reference failed validated subtraction");
+  require(valid.shadowValidationCount > 0 && valid.shadowPromotions > 0 &&
+              valid.shadowTrainingEligibility > 0.9F &&
+              valid.shadowValidationEligibility > 0.9F &&
+              valid.shadowCoherence > 0.9F &&
+              std::isfinite(valid.shadowMicErrorRatio) &&
+              std::isfinite(valid.shadowForegroundErrorRatio),
+          "quiet candidate validation lacked measurable evidence");
+
+  // Match the screenshot levels while the strongest real relationship is
+  // only about 0.5. That weak relationship must not authorize subtraction.
+  const float noiseScale =
+      targetRms /
+      static_cast<float>(std::sqrt(energy(independent, 0, count) / count));
+  for (int i = 0; i < count; ++i) {
+    const float echo = i >= delay ? reference[i - delay] : 0;
+    mic[i] =
+        0.7F * (0.5F * echo + std::sqrt(0.75F) * noiseScale * independent[i]);
+  }
+  buncancel::Aec weak(rate);
+  weak.process(mic.data(), reference.data(), output.data(), count);
+  const auto rejected = weak.diagnostics();
+  require(!weak.aligned() && output == mic &&
+              rejected.shadowDecision ==
+                  buncancel::Aec::ShadowDecision::waitingAlignment &&
+              rejected.shadowPromotions == 0,
+          "quiet weak correlation modified the independent microphone");
+  // A previously valid model can remain aligned during double-talk while the
+  // candidate learner correctly lacks enough far-end evidence to replace it.
+  for (int i = 0; i < count; ++i) {
+    const float echo = reference[(i + count - delay) % count];
+    mic[i] = 0.7F * echo + 1.4F * noiseScale * independent[i];
+  }
+  correlated.process(mic.data(), reference.data(), output.data(), count);
+  const auto held = correlated.diagnostics();
+  require(correlated.aligned() && held.liveConfidence > 0.2F &&
+              held.liveConfidence < 0.65F &&
+              held.shadowDecision ==
+                  buncancel::Aec::ShadowDecision::insufficientEvidence &&
+              held.shadowValidationEligibility < 0.9F &&
+              held.doubleTalkFreezeRatio > 0.95F,
+          "aligned double-talk lacked a specific candidate rejection reason");
+  double projection = 0;
+  double nearEnergy = 0;
+  for (int i = rate * 4; i < count; ++i) {
+    const double near = 1.4F * noiseScale * independent[i];
+    projection += near * output[i];
+    nearEnergy += near * near;
+  }
+  require(projection / nearEnergy > 0.98 && projection / nearEnergy < 1.02,
+          "quiet aligned double-talk damaged the independent near component");
 }
 
 void repeatedBroadbandAmbiguity() {
@@ -548,6 +625,7 @@ int main() {
     trainedMicrophoneMute();
     postAlignmentLearning();
     repeatedBroadbandAmbiguity();
+    quietReferenceEvidence();
     std::cout << "AEC deterministic regression checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << "AEC regression failed: " << error.what() << '\n';

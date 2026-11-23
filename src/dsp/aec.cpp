@@ -266,7 +266,15 @@ Aec::Diagnostics Aec::diagnostics() const noexcept {
       crossPower_ * crossPower_ / (micPower_ * predictedPower_ + 1.0e-20));
   result.subtractionActive =
       aligned_ && !missing_ && lastProcessSubtractionPower_ > 1.0e-12;
-  result.shadowValidating = shadowPhaseSamples_ >= sampleRate_ / 10;
+  result.shadowValidating = aligned_ && shadowPhaseSamples_ >= sampleRate_ / 10;
+  result.shadowDecision =
+      aligned_ ? shadowDecision_ : ShadowDecision::waitingAlignment;
+  result.shadowValidationCount = shadowValidationCount_;
+  result.shadowTrainingEligibility = shadowTrainingEligibility_;
+  result.shadowValidationEligibility = shadowValidationEligibility_;
+  result.shadowCoherence = shadowCoherence_;
+  result.shadowMicErrorRatio = shadowMicErrorRatio_;
+  result.shadowForegroundErrorRatio = shadowForegroundErrorRatio_;
   if (missing_) {
     result.state = AlignmentState::ReferenceMissing;
   }
@@ -277,7 +285,12 @@ void Aec::clearFilter() noexcept {
   std::fill(weights_.begin(), weights_.end(), 0.0F);
   std::fill(shadowWeights_.begin(), shadowWeights_.end(), 0.0F);
   adaptedSamples_ = shadowAdaptedSamples_ = 0;
-  shadowPhaseSamples_ = shadowEligibleSamples_ = 0;
+  shadowPhaseSamples_ = shadowEligibleSamples_ =
+      shadowTrainingEligibleSamples_ = 0;
+  shadowValidationCount_ = 0;
+  shadowDecision_ = ShadowDecision::training;
+  shadowTrainingEligibility_ = shadowValidationEligibility_ = 0;
+  shadowCoherence_ = shadowMicErrorRatio_ = shadowForegroundErrorRatio_ = 0;
   shadowMicEnergy_ = shadowPredictionEnergy_ = shadowCrossEnergy_ = 0;
   shadowForegroundError_ = 0;
   predictedPower_ = crossPower_ = 0;
@@ -322,8 +335,11 @@ void Aec::updateShadow(float microphone, float energy,
         }
       }
       ++shadowAdaptedSamples_;
+      ++shadowTrainingEligibleSamples_;
     }
   } else {
+    if (shadowValidationCount_ == 0)
+      shadowDecision_ = ShadowDecision::validating;
     shadowMicEnergy_ += static_cast<double>(microphone) * microphone;
     shadowPredictionEnergy_ +=
         static_cast<double>(shadowPrediction) * shadowPrediction;
@@ -343,12 +359,28 @@ void Aec::updateShadow(float microphone, float energy,
   const double coherence =
       shadowCrossEnergy_ * shadowCrossEnergy_ /
       (shadowMicEnergy_ * shadowPredictionEnergy_ + 1.0e-20);
-  if (shadowEligibleSamples_ >= validationSamples * 9 / 10 &&
-      shadowAdaptedSamples_ >=
-          static_cast<std::uint64_t>(trainingSamples / 2) &&
-      shadowCrossEnergy_ > 0 && coherence > 0.5 &&
-      candidateError < shadowMicEnergy_ * 0.8 &&
-      candidateError < shadowForegroundError_ * 0.9) {
+  ++shadowValidationCount_;
+  shadowTrainingEligibility_ =
+      static_cast<float>(shadowTrainingEligibleSamples_) / trainingSamples;
+  shadowValidationEligibility_ =
+      static_cast<float>(shadowEligibleSamples_) / validationSamples;
+  shadowCoherence_ = static_cast<float>(coherence);
+  shadowMicErrorRatio_ =
+      static_cast<float>(candidateError / (shadowMicEnergy_ + 1.0e-20));
+  shadowForegroundErrorRatio_ =
+      static_cast<float>(candidateError / (shadowForegroundError_ + 1.0e-20));
+  if (shadowAdaptedSamples_ < static_cast<std::uint64_t>(trainingSamples / 2))
+    shadowDecision_ = ShadowDecision::insufficientTraining;
+  else if (shadowEligibleSamples_ < validationSamples * 9 / 10)
+    shadowDecision_ = ShadowDecision::insufficientEvidence;
+  else if (shadowCrossEnergy_ <= 0 || coherence <= 0.5)
+    shadowDecision_ = ShadowDecision::weakPrediction;
+  else if (candidateError >= shadowMicEnergy_ * 0.8)
+    shadowDecision_ = ShadowDecision::insufficientMicImprovement;
+  else if (candidateError >= shadowForegroundError_ * 0.9)
+    shadowDecision_ = ShadowDecision::foregroundAlreadyBetter;
+  else {
+    shadowDecision_ = ShadowDecision::promoted;
     for (int k = 0; k < taps_; ++k) {
       weights_[static_cast<std::size_t>(k)] =
           static_cast<float>(gain) *
@@ -357,7 +389,8 @@ void Aec::updateShadow(float microphone, float energy,
     adaptedSamples_ = std::max(adaptedSamples_, shadowAdaptedSamples_);
     ++shadowPromotions_;
   }
-  shadowPhaseSamples_ = shadowEligibleSamples_ = 0;
+  shadowPhaseSamples_ = shadowEligibleSamples_ =
+      shadowTrainingEligibleSamples_ = 0;
   shadowMicEnergy_ = shadowPredictionEnergy_ = shadowCrossEnergy_ = 0;
   shadowForegroundError_ = 0;
 }

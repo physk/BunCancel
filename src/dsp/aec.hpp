@@ -28,6 +28,19 @@ public:
     Aligned,
     ReferenceMissing
   };
+  // Outcome of the most recent frozen candidate validation. The current
+  // training/validation phase is reported separately by shadowValidating.
+  enum class ShadowDecision {
+    waitingAlignment,
+    training,
+    validating,
+    insufficientTraining,
+    insufficientEvidence,
+    weakPrediction,
+    insufficientMicImprovement,
+    foregroundAlreadyBetter,
+    promoted
+  };
   struct Diagnostics {
     AlignmentState state = AlignmentState::Warmup;
     // Latest completed search peaks include weak matches. candidateValid
@@ -65,6 +78,13 @@ public:
     // false.
     bool subtractionActive = false;
     bool shadowValidating = false;
+    ShadowDecision shadowDecision = ShadowDecision::waitingAlignment;
+    std::uint64_t shadowValidationCount = 0;
+    float shadowTrainingEligibility = 0;
+    float shadowValidationEligibility = 0;
+    float shadowCoherence = 0;
+    float shadowMicErrorRatio = 0;
+    float shadowForegroundErrorRatio = 0;
   };
   explicit Aec(int sampleRate);
   void process(const float *mic, const float *reference, float *out,
@@ -138,6 +158,14 @@ private:
   std::uint64_t filterAgeSamples_ = 0;
   int shadowPhaseSamples_ = 0;
   int shadowEligibleSamples_ = 0;
+  int shadowTrainingEligibleSamples_ = 0;
+  std::uint64_t shadowValidationCount_ = 0;
+  ShadowDecision shadowDecision_ = ShadowDecision::waitingAlignment;
+  float shadowTrainingEligibility_ = 0;
+  float shadowValidationEligibility_ = 0;
+  float shadowCoherence_ = 0;
+  float shadowMicErrorRatio_ = 0;
+  float shadowForegroundErrorRatio_ = 0;
   double shadowMicEnergy_ = 0;
   double shadowPredictionEnergy_ = 0;
   double shadowCrossEnergy_ = 0;
