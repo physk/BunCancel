@@ -27,7 +27,9 @@ foreach(component IN ITEMS base cmake pluginterfaces public.sdk)
 endforeach()
 add_custom_command(TARGET BunCancel POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${vst3sdk_SOURCE_DIR}/LICENSE.txt"
-        "$<TARGET_FILE_DIR:BunCancel>/../Resources/licenses/VST3-SDK-LICENSE.txt")
+        "$<TARGET_FILE_DIR:BunCancel>/../Resources/licenses/VST3-SDK-LICENSE.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BunCancel_SOURCE_DIR}/LICENSE"
+        "$<TARGET_FILE_DIR:BunCancel>/../Resources/licenses/BunCancel-LICENSE.txt")
 
 if(BUILD_TESTING)
     add_executable(buncancel-editor-smoke

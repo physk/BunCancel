@@ -15,6 +15,8 @@ jobs:
       - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build --config Release --parallel
       - run: ctest --test-dir build -C Release --output-on-failure
+        env:
+          BUNCANCEL_FIELD_EXPORT: ${{ github.workspace }}/build/field-audio
       - run: python -m unittest discover -s tests/audio -p "test_*.py" -v
       - run: python tools/check_public_docs.py
       - if: runner.os == 'Linux'
@@ -23,5 +25,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: development-audio-and-metrics
-          path: build/evaluation/
+          path: |
+            build/evaluation/
+            build/field-audio/
           retention-days: 7

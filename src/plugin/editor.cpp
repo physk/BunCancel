@@ -120,9 +120,30 @@ const wchar_t *nextAction(ProcessingStatus status) {
   return L"Next: check the host audio connection.";
 }
 
+const wchar_t *filterActivity(const Diagnostics &value) {
+  if (!value.dsp_available)
+    return L"Filter unavailable while reference timing is dry";
+  if (!value.aligned)
+    return L"Monitoring for a stable echo delay";
+  if (value.subtraction_active)
+    return value.reducing ? L"Subtracting with measured level reduction"
+                          : L"Subtracting; level reduction unconfirmed";
+  if (value.live_confidence < 0.2f)
+    return L"Current echo correlation is weak";
+  if (value.shadow_validating || value.weights_norm == 0.0f ||
+      value.adapted_samples < 2048)
+    return L"Learning and validating the echo filter";
+  if (value.freeze_ratio > 0.95f)
+    return L"Adaptation mostly frozen by near-end protection";
+  if (value.prediction_rms < 1.0e-5f || value.subtraction_gain < 0.01f)
+    return L"Echo prediction is weak; preserving the microphone";
+  return L"Monitoring; subtraction is currently negligible";
+}
+
 std::wstring diagnosticsText(const Diagnostics &value, bool available) {
   std::wstring result = meter(L"Mic", available && value.mic_available,
                               value.mic_rms, value.mic_peak);
+  result += L" (mono)";
   result +=
       L"\r\n" + meter(L"Reference", available && value.reference_available,
                       value.reference_rms, value.reference_peak);
@@ -130,8 +151,18 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
     return result +
            L"\r\nRates: unavailable\r\nGaps / underruns: unavailable"
            L"\r\nPeak correlation: unavailable"
-           L"\r\nCandidate lag: unavailable\r\nPacket timing: unavailable";
-  wchar_t text[256]{};
+           L"\r\nCandidate lag: unavailable\r\nPacket timing: unavailable"
+           L"\r\nFilter telemetry: unavailable";
+  wchar_t text[320]{};
+  if (value.mic_available) {
+    std::swprintf(text, std::size(text),
+                  L"\r\nOutput RMS: %ls dBFS / changed: %u of %u samples",
+                  level(value.output_rms).c_str(), value.changed_samples,
+                  value.block_samples);
+    result += text;
+  } else {
+    result += L"\r\nOutput RMS: unavailable / changed samples: unavailable";
+  }
   if (value.host_sample_rate > 0.0)
     std::swprintf(text, std::size(text), L"\r\nHost: %.0f Hz / capture: ",
                   value.host_sample_rate);
@@ -145,17 +176,19 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
                 static_cast<unsigned long long>(value.dropouts),
                 static_cast<unsigned long long>(value.underruns));
   result += text;
+  if (value.last_underrun_valid) {
+    std::swprintf(text, std::size(text), L" / last: %.2f s ago",
+                  value.last_underrun_age_ms / 1000);
+    result += text;
+  }
   if (value.candidate_valid) {
     std::swprintf(text, std::size(text),
-                  L"\r\nPeak correlation: %.3f\r\nCandidate lag: %.2f ms%ls",
+                  L"\r\nPeak correlation: %.3f / candidate lag: %.2f ms (%ls)",
                   value.correlation, value.candidate_delay_ms,
-                  value.aligned               ? L" (aligned)"
-                  : value.candidate_confirmed ? L" (confirmed)"
-                                              : L" (unconfirmed)");
+                  value.candidate_confirmed ? L"confirmed" : L"unconfirmed");
     result += text;
   } else {
-    result +=
-        L"\r\nPeak correlation: unavailable\r\nCandidate lag: unavailable";
+    result += L"\r\nPeak correlation: unavailable / Candidate lag: unavailable";
   }
   if (value.timing_valid) {
     std::swprintf(
@@ -166,13 +199,66 @@ std::wstring diagnosticsText(const Diagnostics &value, bool available) {
   } else {
     result += L"\r\nPacket timing: unavailable";
   }
+  if (!value.dsp_available)
+    return result + L"\r\nFilter telemetry: unavailable";
+  if (value.aligned) {
+    std::swprintf(text, std::size(text),
+                  L"\r\nActive echo lag: %.2f ms (includes holdback)",
+                  value.active_delay_ms);
+    result += text;
+  } else {
+    result += L"\r\nActive echo lag: none";
+  }
+  std::swprintf(text, std::size(text),
+                L"\r\nLive confidence: %.3f / prediction coherence: %.3f",
+                value.live_confidence, value.prediction_coherence);
+  result += text;
+  std::swprintf(text, std::size(text), L"\r\nCompeting delay peak: %.3f",
+                value.competing_correlation);
+  result += text;
+  result += L"\r\nRolling mic/output RMS: " + level(value.filter_mic_rms) +
+            L" / " + level(value.filter_output_rms) + L" dBFS";
+  if (value.filter_mic_rms > 0 && value.filter_output_rms > 0) {
+    std::swprintf(
+        text, std::size(text), L" / %+.2f dB",
+        20 * std::log10(value.filter_mic_rms / value.filter_output_rms));
+    result += text;
+  }
+  std::swprintf(text, std::size(text),
+                L"\r\nAdapted samples: %llu / weights L1: %.4f",
+                static_cast<unsigned long long>(value.adapted_samples),
+                value.weights_norm);
+  result += text;
+  std::swprintf(text, std::size(text),
+                L"\r\nShadow samples: %llu / promotions: %llu",
+                static_cast<unsigned long long>(value.shadow_adapted_samples),
+                static_cast<unsigned long long>(value.shadow_promotions));
+  result += text;
+  result += L"\r\nPrediction RMS: " + level(value.prediction_rms) +
+            L" / subtraction RMS: " + level(value.subtraction_rms) + L" dBFS";
+  std::swprintf(text, std::size(text),
+                L"\r\nSubtraction gain: %.3f / adaptation frozen: %.1f%%",
+                value.subtraction_gain, 100 * value.freeze_ratio);
+  result += text;
+  std::swprintf(text, std::size(text), L"\r\nFilter age: %.2f s / resets: %llu",
+                value.filter_age_ms / 1000,
+                static_cast<unsigned long long>(value.filter_resets));
+  result += text;
+  result += L"\r\nActual delta RMS: " + level(value.delta_rms) + L" dBFS";
+  if (value.block_power_delta_valid) {
+    std::swprintf(text, std::size(text), L" / mic-output: %+.2f dB",
+                  value.block_power_delta_db);
+    result += text;
+  }
+  result += L"\r\n";
+  result += filterActivity(value);
   return result;
 }
 
 class NativeEditor final : public CPluginView {
 public:
   explicit NativeEditor(EditController *controller) : controller_(controller) {
-    rect = ViewRect(0, 0, 660, 600);
+    rect = ViewRect(0, 0, 760, 600);
   }
 
   ~NativeEditor() override { detachWindow(); }
@@ -256,7 +342,7 @@ public:
     if (!size)
       return kInvalidArgument;
     size->right =
-        size->left + std::max(size->getWidth(), MulDiv(560, dpi_, 96));
+        size->left + std::max(size->getWidth(), MulDiv(640, dpi_, 96));
     size->bottom =
         size->top + std::max(size->getHeight(), MulDiv(600, dpi_, 96));
     return kResultOk;
@@ -289,14 +375,16 @@ private:
                       BS_AUTOCHECKBOX | WS_TABSTOP, bypassControlId);
     statusLabel_ = control(L"STATIC", L"Reference / AEC status", SS_LEFT, 0);
     status_ = control(L"STATIC", L"", SS_LEFT, statusControlId);
-    diagnostics_ = control(L"STATIC", L"", SS_LEFT, diagnosticsControlId);
+    diagnostics_ = control(L"EDIT", L"",
+                           ES_MULTILINE | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+                           diagnosticsControlId);
     action_ = control(L"STATIC", L"", SS_LEFT, actionControlId);
-    note_ =
-        control(L"STATIC",
-                L"Use a playback mix without microphone monitoring.\r\n"
-                L"Missing reference keeps the microphone dry.\r\n"
-                L"Timing = estimated mic start - reference packet start (QPC).",
-                SS_LEFT, 0);
+    note_ = control(
+        L"STATIC",
+        L"Use a playback mix without microphone monitoring.\r\n"
+        L"Missing reference keeps the microphone dry.\r\n"
+        L"Scroll diagnostics for filter details. Level change is not ERLE.",
+        SS_LEFT, 0);
     if (!title_ || !subtitle_ || !enable_ || !sourceLabel_ || !endpoint_ ||
         !bypass_ || !statusLabel_ || !status_ || !diagnostics_ || !action_ ||
         !note_)
@@ -324,7 +412,7 @@ private:
     GetClientRect(window_, &bounds);
     // A host may decline a DPI resize; keep every control visible in that case.
     const auto scale =
-        std::min({dpi_ / 96.0, bounds.right / 560.0, bounds.bottom / 600.0});
+        std::min({dpi_ / 96.0, bounds.right / 640.0, bounds.bottom / 600.0});
     const auto pixel = [scale](int value) {
       return std::max(1, static_cast<int>(std::lround(value * scale)));
     };
@@ -400,7 +488,9 @@ private:
           text = L"Ready - monitoring / ambiguous echo delay";
           break;
         case AlignmentReason::aligned:
-          text = L"Ready - aligned / no subtraction observed";
+          text = snapshot.subtraction_active
+                     ? L"Ready - subtracting / reduction unconfirmed"
+                     : L"Ready - aligned / filter monitoring";
           break;
         default:
           text = L"Ready - monitoring";
@@ -415,7 +505,15 @@ private:
     const auto details = diagnosticsText(snapshot, available);
     if (details != diagnosticsText_) {
       diagnosticsText_ = details;
+      const auto firstLine =
+          SendMessageW(diagnostics_, EM_GETFIRSTVISIBLELINE, 0, 0);
+      DWORD selectionStart = 0, selectionEnd = 0;
+      SendMessageW(diagnostics_, EM_GETSEL,
+                   reinterpret_cast<WPARAM>(&selectionStart),
+                   reinterpret_cast<LPARAM>(&selectionEnd));
       SetWindowTextW(diagnostics_, details.c_str());
+      SendMessageW(diagnostics_, EM_SETSEL, selectionStart, selectionEnd);
+      SendMessageW(diagnostics_, EM_LINESCROLL, 0, firstLine);
     }
     auto actionStatus =
         available ? snapshot.status : ProcessingStatus::unavailable;
@@ -429,7 +527,12 @@ private:
       else if (snapshot.alignment_reason == AlignmentReason::delayOutOfRange)
         actionStatus = ProcessingStatus::delayOutOfRange;
     }
-    SetWindowTextW(action_, nextAction(actionStatus));
+    const auto action =
+        available && snapshot.status == ProcessingStatus::readyMonitoring &&
+                snapshot.aligned
+            ? filterActivity(snapshot)
+            : nextAction(actionStatus);
+    SetWindowTextW(action_, action);
   }
 
   void edit(ParamID id, ParamValue value) {
@@ -445,7 +548,7 @@ private:
   void requestDpiSize(bool force = false) {
     if (!plugFrame)
       return;
-    ViewRect desired(0, 0, MulDiv(660, dpi_, 96), MulDiv(600, dpi_, 96));
+    ViewRect desired(0, 0, MulDiv(760, dpi_, 96), MulDiv(600, dpi_, 96));
     if (force || desired.getWidth() != rect.getWidth() ||
         desired.getHeight() != rect.getHeight())
       plugFrame->resizeView(this, &desired);

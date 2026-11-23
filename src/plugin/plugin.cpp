@@ -49,7 +49,7 @@ constexpr const char *statusRequest = "BunCancel.Status.Request";
 constexpr const char *statusReply = "BunCancel.Status.Reply";
 constexpr const char *statusAttribute = "status";
 
-constexpr const char *diagnosticsAttribute = "diagnostics.v1";
+constexpr const char *diagnosticsAttribute = "diagnostics.v2";
 
 // Atomic words avoid the C++ data race that a plain-data seqlock would have.
 // One writer publishes, readers make bounded attempts and retain their previous
@@ -388,6 +388,7 @@ public:
       hostClock_.reset();
       haveReference_ = false;
       underruns_ = 0;
+      lastUnderrunQpc_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
       rawReferenceRms_ = rawReferencePeak_ = 0;
       rawReferenceQpc_ = rawReferenceObservedQpc_ = 0;
@@ -451,8 +452,14 @@ public:
           break;
         }
       }
-      if (!enabled_.load() || bypass_.load())
+      if (!enabled_.load() || bypass_.load()) {
         diagnostic.aligned = diagnostic.reducing = false;
+        diagnostic.dsp_available = diagnostic.subtraction_active = false;
+      }
+      if (sourceChanged) {
+        diagnostic.underruns = diagnostic.dropouts = 0;
+        diagnostic.last_underrun_valid = false;
+      }
       if (sourceChanged ||
           capture_.status() != capture::CaptureStatus::running) {
         diagnostic.reference_available = false;
@@ -463,13 +470,16 @@ public:
         diagnostic.timing_valid = diagnostic.candidate_valid = false;
         diagnostic.candidate_confirmed = false;
         diagnostic.aligned = diagnostic.reducing = false;
+        diagnostic.dsp_available = diagnostic.subtraction_active = false;
       }
       if (!running_.load() || !processing_.load() || staleObservation) {
+        diagnostic.last_underrun_valid = false;
         diagnostic.mic_available = false;
         diagnostic.reference_available = false;
         diagnostic.timing_valid = false;
         diagnostic.candidate_valid = false;
         diagnostic.aligned = diagnostic.reducing = false;
+        diagnostic.dsp_available = diagnostic.subtraction_active = false;
       }
       auto reply = owned(allocateMessage());
       if (!reply || !reply->getAttributes())
@@ -561,9 +571,14 @@ public:
         diagnostic.timing_valid = diagnostic.candidate_valid = false;
         diagnostic.candidate_confirmed = false;
         diagnostic.underruns = diagnostic.dropouts = 0;
-      }
-      if (!enabled_.load() || bypass_.load())
+        diagnostic.last_underrun_valid = false;
         diagnostic.aligned = diagnostic.reducing = false;
+        diagnostic.dsp_available = diagnostic.subtraction_active = false;
+      }
+      if (!enabled_.load() || bypass_.load()) {
+        diagnostic.aligned = diagnostic.reducing = false;
+        diagnostic.dsp_available = diagnostic.subtraction_active = false;
+      }
       if (bypass_.load())
         diagnostic.status = ProcessingStatus::bypassed;
       else if (!enabled_.load())
@@ -615,6 +630,7 @@ public:
       audioSelection_ = selected;
       haveReference_ = false;
       underruns_ = 0;
+      lastUnderrunQpc_ = 0;
       dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
       rawReferenceRms_ = rawReferencePeak_ = 0;
       rawReferenceQpc_ = rawReferenceObservedQpc_ = 0;
@@ -686,8 +702,10 @@ public:
         connected && !complete && (haveReference_ || prefillExpired);
     if (complete)
       haveReference_ = true;
-    else if (interrupted)
+    else if (interrupted) {
       ++underruns_;
+      lastUnderrunQpc_ = callbackQpc_;
+    }
     if (fits) {
       engine_->process(microphone_.data(),
                        complete && enabled ? reference_.data() : nullptr, out,
@@ -701,25 +719,73 @@ public:
     // The DSP still observes the missing reference to invalidate old
     // adaptation.
     if ((!complete || !enabled) && !hostSilent)
-      std::copy_n(mic, frames, out);
+      std::copy_n(fits ? microphone_.data() : mic, frames, out);
     // AEC must never synthesize output when the microphone is actually silent.
     if (micQuiet)
       std::fill_n(out, frames, 0.0f);
     data.outputs[0].silenceFlags = micQuiet ? 1 : 0;
+    double outputEnergy = 0;
+    double deltaEnergy = 0;
+    for (std::size_t i = 0; i < frames; ++i) {
+      const float input = fits ? microphone_[i] : hostSilent ? 0.0f : mic[i];
+      if (std::isfinite(out[i]))
+        outputEnergy += static_cast<double>(out[i]) * out[i];
+      if (std::isfinite(input) && std::isfinite(out[i])) {
+        const double delta = static_cast<double>(input) - out[i];
+        deltaEnergy += delta * delta;
+        diagnostic.changed_samples += input != out[i];
+      }
+    }
+    diagnostic.output_rms =
+        static_cast<float>(std::sqrt(outputEnergy / frames));
+    diagnostic.delta_rms = static_cast<float>(std::sqrt(deltaEnergy / frames));
+    diagnostic.block_samples = static_cast<std::uint32_t>(frames);
+    diagnostic.block_power_delta_valid = micEnergy > 0 && outputEnergy > 0;
+    if (diagnostic.block_power_delta_valid)
+      diagnostic.block_power_delta_db =
+          static_cast<float>(10 * std::log10(micEnergy / outputEnergy));
+    diagnostic.last_underrun_valid =
+        lastUnderrunQpc_ && callbackQpc_ >= lastUnderrunQpc_;
+    if (diagnostic.last_underrun_valid)
+      diagnostic.last_underrun_age_ms =
+          (callbackQpc_ - lastUnderrunQpc_) / 10000.0;
     if (engine_) {
       const auto alignment = engine_->diagnostics();
       diagnostic.alignment_reason =
           static_cast<AlignmentReason>(alignment.state);
       diagnostic.candidate_valid = alignment.peakValid;
-      diagnostic.candidate_confirmed = alignment.candidateValid;
-      const auto observedLag = alignment.candidateValid
-                                   ? alignment.candidateLagSamples
-                                   : alignment.peakLagSamples;
-      diagnostic.candidate_delay_ms = 1000.0 * observedLag / rate_ + 20;
+      diagnostic.candidate_confirmed =
+          alignment.candidateValid &&
+          alignment.peakLagSamples == alignment.candidateLagSamples;
+      diagnostic.candidate_delay_ms =
+          1000.0 * alignment.peakLagSamples / rate_ + 20;
+      diagnostic.active_delay_ms =
+          1000.0 * engine_->delaySamples() / rate_ + 20;
       diagnostic.correlation = alignment.peakCorrelation;
       diagnostic.aligned = complete && enabled && engine_->aligned();
       diagnostic.reduction_db = alignment.reductionDb;
-      diagnostic.reducing = diagnostic.aligned && alignment.reductionValid &&
+      diagnostic.dsp_available = complete && enabled;
+      diagnostic.adapted_samples = alignment.adaptedSamples;
+      diagnostic.shadow_adapted_samples = alignment.shadowAdaptedSamples;
+      diagnostic.shadow_promotions = alignment.shadowPromotions;
+      diagnostic.filter_resets = alignment.filterResetCount;
+      diagnostic.filter_age_ms = 1000.0 * alignment.samplesSinceReset / rate_;
+      diagnostic.weights_norm = alignment.weightsNorm;
+      diagnostic.prediction_rms = alignment.predictionRms;
+      diagnostic.subtraction_rms = alignment.subtractionRms;
+      diagnostic.subtraction_gain = alignment.subtractionGain;
+      diagnostic.freeze_ratio = alignment.doubleTalkFreezeRatio;
+      diagnostic.live_confidence = alignment.liveConfidence;
+      diagnostic.prediction_coherence = alignment.predictionCoherence;
+      diagnostic.competing_correlation = alignment.competingPeakCorrelation;
+      diagnostic.shadow_validating = alignment.shadowValidating;
+      diagnostic.filter_mic_rms = alignment.microphoneRms;
+      diagnostic.filter_output_rms = alignment.outputRms;
+      diagnostic.subtraction_active = diagnostic.dsp_available &&
+                                      diagnostic.aligned &&
+                                      diagnostic.changed_samples > 0;
+      diagnostic.reducing = diagnostic.subtraction_active &&
+                            alignment.reductionValid &&
                             alignment.reductionDb > 0 && !micQuiet;
     }
     diagnostic.underruns = underruns_;
@@ -838,7 +904,7 @@ private:
   int audioSelection_ = 0;
   std::atomic<std::uint64_t> captureEpoch_{0};
   std::uint64_t underruns_ = 0, dropoutBase_ = 0, rawReferenceQpc_ = 0;
-  std::uint64_t rawReferenceObservedQpc_ = 0;
+  std::uint64_t rawReferenceObservedQpc_ = 0, lastUnderrunQpc_ = 0;
   std::uint64_t callbackQpc_ = 0, waitingSinceQpc_ = 0;
   float rawReferenceRms_ = 0, rawReferencePeak_ = 0;
   bool haveReference_ = false;
@@ -859,10 +925,10 @@ using namespace Steinberg::Vst;
 BEGIN_FACTORY_DEF("BunCancel", "", "")
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::processorId),
            PClassInfo::kManyInstances, kVstAudioEffectClass,
-           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.2",
+           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.3",
            kVstVersionString, buncancel::plugin::Processor::create)
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::controllerId),
            PClassInfo::kManyInstances, kVstComponentControllerClass,
-           "BunCancel Controller", 0, "", "0.1.2", kVstVersionString,
+           "BunCancel Controller", 0, "", "0.1.3", kVstVersionString,
            buncancel::plugin::Controller::create)
 END_FACTORY

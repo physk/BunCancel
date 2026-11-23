@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(BunCancel VERSION 0.1.2 LANGUAGES CXX)
+project(BunCancel VERSION 0.1.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -38,6 +38,11 @@ if(BUILD_TESTING)
     target_include_directories(buncancel-pipeline-tests PRIVATE src src/plugin)
     target_link_libraries(buncancel-pipeline-tests PRIVATE buncancel-capture buncancel-dsp)
     add_test(NAME reference-pipeline COMMAND buncancel-pipeline-tests)
+
+    add_executable(buncancel-post-alignment-tests tests/integration/test_post_alignment.cpp)
+    target_include_directories(buncancel-post-alignment-tests PRIVATE src src/plugin)
+    target_link_libraries(buncancel-post-alignment-tests PRIVATE buncancel-capture buncancel-dsp)
+    add_test(NAME post-alignment COMMAND buncancel-post-alignment-tests)
 endif()
 if(BUNCANCEL_BUILD_VST3)
     if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)

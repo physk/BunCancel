@@ -3,9 +3,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <objbase.h>
 #include <windows.h>
 
 #include "base/source/fstreamer.h"
+#include "diagnostics.hpp"
 #include "pluginterfaces/base/ipluginbase.h"
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -129,6 +131,46 @@ private:
   uint32 references_ = 1;
 };
 
+// Supplies explicit UI observations without replacing the real processor tests.
+class DiagnosticPeer final : public IConnectionPoint {
+public:
+  explicit DiagnosticPeer(IConnectionPoint *controller)
+      : controller_(controller) {}
+  buncancel::plugin::Diagnostics observation;
+  tresult PLUGIN_API queryInterface(const TUID iid, void **object) override {
+    *object = nullptr;
+    if (FUnknownPrivate::iidEqual(iid, IConnectionPoint::iid) ||
+        FUnknownPrivate::iidEqual(iid, FUnknown::iid)) {
+      *object = static_cast<IConnectionPoint *>(this);
+      addRef();
+      return kResultOk;
+    }
+    return kNoInterface;
+  }
+  uint32 PLUGIN_API addRef() override { return ++references_; }
+  uint32 PLUGIN_API release() override { return --references_; }
+  tresult PLUGIN_API connect(IConnectionPoint *) override { return kResultOk; }
+  tresult PLUGIN_API disconnect(IConnectionPoint *) override {
+    return kResultOk;
+  }
+  tresult PLUGIN_API notify(IMessage *request) override {
+    if (!request || !request->getMessageID() ||
+        std::strcmp(request->getMessageID(), "BunCancel.Status.Request") != 0)
+      return kResultFalse;
+    HostMessage reply;
+    reply.setMessageID("BunCancel.Status.Reply");
+    reply.getAttributes()->setInt("status",
+                                  static_cast<int64>(observation.status));
+    reply.getAttributes()->setBinary("diagnostics.v2", &observation,
+                                     sizeof(observation));
+    return controller_->notify(&reply);
+  }
+
+private:
+  IConnectionPoint *controller_;
+  uint32 references_ = 1;
+};
+
 void pump() {
   MSG message{};
   while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
@@ -159,7 +201,7 @@ HWND findControl(HWND parent, int id) {
 }
 
 std::wstring text(HWND window) {
-  std::array<wchar_t, 1024> buffer{};
+  std::array<wchar_t, 4096> buffer{};
   GetWindowTextW(window, buffer.data(), static_cast<int>(buffer.size()));
   return buffer.data();
 }
@@ -236,6 +278,10 @@ void dryProcessor(IComponent *component, IAudioProcessor *processor,
               queue->getPoint(0, offset, value) == kResultOk && value > 0,
           "missing reference status is missing");
   controller->setParamNormalized(statusId, value);
+  outputChannel = mic.data();
+  const auto originalMic = mic;
+  require(processor->process(data) == kResultOk && mic == originalMic,
+          "in-place missing-reference processing changed microphone samples");
 
   MemoryStream saved;
   require(component->getState(&saved) == kResultOk, "state save failed");
@@ -380,6 +426,7 @@ void editor(IComponent *component, IEditController *controller,
           liveDetails.find(L"dBFS") != std::wstring::npos &&
           liveDetails.find(L"Reference: unavailable") != std::wstring::npos &&
           liveDetails.find(L"Host: 48000 Hz") != std::wstring::npos &&
+          liveDetails.find(L"changed: 0 of 128") != std::wstring::npos &&
           liveDetails.find(L"Gaps:") != std::wstring::npos &&
           liveDetails.find(L"underruns:") != std::wstring::npos &&
           liveDetails.find(L"Peak correlation: unavailable") !=
@@ -456,6 +503,74 @@ void editor(IComponent *component, IEditController *controller,
           text(diagnostics).find(L"Rates: unavailable") != std::wstring::npos &&
           text(action).find(L"reconnect the processor") != std::wstring::npos,
       "disconnect retained live diagnostics or omitted recovery guidance");
+  DiagnosticPeer diagnosticPeer(controllerConnection);
+  auto &observation = diagnosticPeer.observation;
+  observation.status = buncancel::plugin::ProcessingStatus::readyMonitoring;
+  observation.alignment_reason = buncancel::plugin::AlignmentReason::aligned;
+  observation.mic_available = observation.reference_available = true;
+  observation.dsp_available = observation.aligned = true;
+  observation.host_sample_rate = observation.reference_sample_rate = 48000;
+  observation.mic_rms = 0.02f;
+  observation.output_rms = 0.02f;
+  observation.filter_mic_rms = observation.filter_output_rms = 0.02f;
+  observation.mic_peak = observation.reference_peak = 0.05f;
+  observation.reference_rms = 0.0125f;
+  observation.candidate_valid = observation.candidate_confirmed = true;
+  observation.correlation = 0.747f;
+  observation.candidate_delay_ms = observation.active_delay_ms = 272;
+  observation.live_confidence = 0.7f;
+  observation.adapted_samples = 8000;
+  observation.weights_norm = 1;
+  observation.freeze_ratio = 1;
+  observation.prediction_rms = 0.001f;
+  observation.filter_age_ms = 4000;
+  observation.block_samples = 256;
+  observation.last_underrun_valid = true;
+  observation.last_underrun_age_ms = 1250;
+  require(controllerConnection->connect(&diagnosticPeer) == kResultOk,
+          "controlled diagnostic peer connection failed");
+  refresh(status);
+  require(text(status) == L"Ready - aligned / filter monitoring" &&
+              text(action).find(L"frozen by near-end protection") !=
+                  std::wstring::npos,
+          "aligned protected filter did not explain absent subtraction");
+  const auto stalled = text(diagnostics);
+  for (const auto *expected :
+       {L"(mono)", L"changed: 0 of 256", L"Live confidence: 0.700",
+        L"Peak correlation: 0.747", L"Active echo lag: 272.00",
+        L"Adapted samples: 8000", L"weights L1: 1.0000",
+        L"adaptation frozen: 100.0%", L"Filter age: 4.00 s",
+        L"last: 1.25 s ago", L"Prediction RMS:"})
+    require(stalled.find(expected) != std::wstring::npos,
+            "detailed stalled-filter observation was omitted");
+  require((GetWindowLongW(diagnostics, GWL_STYLE) & ES_READONLY) != 0 &&
+              (GetWindowLongW(diagnostics, GWL_STYLE) & WS_VSCROLL) != 0,
+          "long diagnostics must remain readable and scrollable");
+  SendMessageW(diagnostics, EM_LINESCROLL, 0, 100);
+  require(SendMessageW(diagnostics, EM_GETFIRSTVISIBLELINE, 0, 0) > 0,
+          "filter details cannot be reached by scrolling");
+  observation.subtraction_active = true;
+  observation.changed_samples = 256;
+  observation.delta_rms = 0.001f;
+  observation.filter_output_rms = 0.015f;
+  refresh(status);
+  require(text(status) == L"Ready - subtracting / reduction unconfirmed" &&
+              text(diagnostics).find(L"changed: 256 of 256") !=
+                  std::wstring::npos &&
+              text(diagnostics).find(L"/ +2.50 dB") != std::wstring::npos &&
+              SendMessageW(diagnostics, EM_GETFIRSTVISIBLELINE, 0, 0) > 0,
+          "actual subtraction was confused with measured reduction");
+  observation.status = buncancel::plugin::ProcessingStatus::cancelling;
+  observation.reducing = true;
+  refresh(status);
+  require(text(status).find(L"Cancelling") == 0,
+          "measured reduction did not reach the UI");
+  require(controllerConnection->disconnect(&diagnosticPeer) == kResultOk,
+          "controlled diagnostic peer disconnect failed");
+  refresh(status);
+  require(text(diagnostics).find(L"Filter telemetry: unavailable") !=
+              std::wstring::npos,
+          "controlled filter observation stayed live after disconnect");
   require(processorConnection->connect(controllerConnection) == kResultOk &&
               controllerConnection->connect(processorConnection) == kResultOk,
           "status reconnect failed");

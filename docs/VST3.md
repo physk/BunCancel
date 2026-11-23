@@ -6,7 +6,7 @@ integration; host/device and physical audio acceptance gates remain open.
 
 ## Install or upgrade the Windows bundle
 
-1. Use the editor-enabled build (plugin version 0.1.2). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
+1. Use the editor-enabled build (plugin version 0.1.3). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
 2. Close Wave Link and any other hosts using the plugin. Save the current host settings. In the VST3 search directory, the existing `BunCancel.vst3` may be a single file or a folder with that same name. Move the **entire existing item** to a backup directory outside the scan paths. Keep the backup until the upgrade works.
 3. Copy the **outer folder** from staging into the search directory. A typical resulting path is `C:\Program Files\Common Files\VST3\BunCancel.vst3\Contents\x86_64-win\BunCancel.vst3`. Leave the resources and inner binary together. Installing a second loose copy of the inner binary can make the host resolve the wrong plugin.
 4. Reopen the host, rescan if available, and open BunCancel's editor on the microphone chain. The editor should show the playback-reference picker, enable and bypass controls, and processing status. To roll back, close the host, move the new bundle out of the scan path and restore the backed-up item under its original name.
@@ -26,6 +26,8 @@ The Windows workflow also runs the SDK's `validator.exe` against the full bundle
 ## Reference selection and lifecycle
 
 A Wave Link 3 field test of 0.1.1 confirmed that the custom editor opened and listed Personal Mix as a capture endpoint. The host showed active microphone and playback meters while BunCancel stayed at “Dry - acquiring alignment”. That editor status established that reference samples reached the DSP. The host meters could not show the PCM levels inside BunCancel, their relative timing or how much playback reached the mic.
+
+A subsequent 0.1.2 field observation showed a mono microphone at −34.0 dBFS RMS and the Personal Mix capture endpoint at −38.1 dBFS RMS. Both clocks reported 48 kHz. The displayed lag was 272 ms, the search peak was 0.747, and the packet offset was +3.79 ms. Those last two time readings describe different events. With 20 ms of reference holdback, the filter was using an effective lag of about 252 ms. The packet offset describes the latest capture delivery relative to the mic block. Neither value measures how much the filter subtracted. The 15 underruns were cumulative; their timing relative to the screenshot is unknown.
 
 ### Local Wave Link check
 
@@ -55,7 +57,29 @@ The callback estimates the microphone block start from its end time, block lengt
 
 The DSP can subtract at effective lags of two samples through 333 ms after holdback. It also checks excluded lags down to −40 ms and up to 500 ms for diagnostics only. A reference arriving too late for the current mic block, a very short path inside the holdback or a long wireless delay can still leave correlated leakage dry. The microphone has zero algorithmic lookahead. Reference timing uses WASAPI packet timestamps and an estimate of the host block time. Host buffering and device latency can contribute to the observed lag. A timestamp on a callback is not a measurement of when sound reached the microphone.
 
-## Measured timing regressions
+## When the filter aligns but leakage remains
+
+The microphone path accepts mono. The stereo capture meter measures incoming samples before downmix. The delay search compares the downmixed reference with the mono microphone. A high search peak can come from a different lag or an earlier passage. Use the live confidence at the active lag to see whether that relationship persists. Repeating material can produce competing peaks at multiple delays.
+
+The original foreground filter adapts conservatively to protect near-end speech. A change in the acoustic path can drive its prediction coherence below the update threshold, even during far-end-only playback. Once that happens, the same stale prediction can keep the filter frozen. Version 0.1.3 also learns a bounded candidate filter from correlated reference samples. It freezes the candidate coefficients and evaluates the prediction on later samples against both the dry microphone and the current output. Only a candidate that improves both can replace the audible filter. Both filters use the same finite tail and zero mic lookahead.
+
+Use the editor's changed-sample count, output RMS and mic-to-output level change to see what reached the host on the most recent block. Adapted samples, prediction level, subtraction gain and the recent freeze fraction explain how that result arose. A low filter age together with recent underruns suggests interrupted learning. A stable filter age and a high freeze fraction suggest an acoustic model that is no longer tracking the mic, or simultaneous near-end speech. The live level change includes speech and cannot establish far-only ERLE.
+
+### Post-alignment regression measurements
+
+Run `ctest --test-dir build -C Release -V -R "^post-alignment$"`. Set `BUNCANCEL_FIELD_EXPORT` to a directory to save synthetic stems, processed WAVs and metrics. Tests use a 272 ms path, −38.1 dBFS downmixed reference, approximately −33.5 dBFS mono mic during the initial far-only window, and unequal left and right playback channels. After a path change at six seconds, far-only ERLE is measured from nine to ten seconds. The old and new engines receive identical samples.
+
+| Synthetic path | 0.1.2 far-only ERLE | 0.1.3 far-only ERLE |
+| --- | ---: | ---: |
+| Stable reflection, gain change | 11.38 dB | 13.03 dB |
+| Changed reflection | 3.70 dB | 13.14 dB |
+| Changed reflection and polarity | 0.00 dB | 13.09 dB |
+
+On the polarity stress case, the old engine stayed aligned with live correlation 0.748 and passed every mic sample through unchanged in the scored far-only second. The constrained subtraction gain had fallen to zero. In the changed-reflection case the new engine's projection onto clean near speech during double-talk was 0.997, and residual error energy was 1.56% of clean near-end energy. The near-only tail passed through exactly. The same changed reflection with a short capture interruption reached 12.33 dB far-only ERLE after recovery. These generated cases establish failure mechanisms and regression coverage. The cause of the field observation and physical attenuation remain open.
+
+The established nine-fixture development matrix still includes difficult short, cold-start windows. The baseline far-only score increased from 2.10 to 2.47 dB and the drifting case remained at 0.75 dB. The 128-tap acoustic model spans only 2.67 ms at 48 kHz after bulk delay alignment. Longer room reflections can remain audible.
+
+## Timing regressions measured in 0.1.2
 
 Run `ctest --test-dir build-vst3 -C Release -V -R "^reference-(timeline|pipeline)$"` for the deterministic clock and signal scenarios. The pipeline test feeds identical generated reference and mic samples to a reproduction of the former FIFO policy and to the production timeline, host clock and AEC. At 48 kHz it scores the final two seconds of each six-second signal. The paths in this table have a strong direct component and one short reflection.
 
