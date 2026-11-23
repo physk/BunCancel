@@ -163,6 +163,17 @@ class ScoreTests(unittest.TestCase):
             scorer.fidelity([0.0], [1.0])["snr"]["status"], "silent_target"
         )
 
+    def test_rejects_malformed_manifest_types(self):
+        for manifest in [
+            [],
+            {**self.manifest, "evaluation_windows": [{"kind": []}]},
+            {**self.manifest, "nonlinear_mic_clip": "false"},
+        ]:
+            with self.subTest(manifest=manifest):
+                (self.root / "manifest.json").write_text(json.dumps(manifest))
+                with self.assertRaises(scorer.ScoreError):
+                    self.score()
+
     def test_requires_schema_two(self):
         self.manifest["schema"] = 1
         self.write_manifest()

@@ -167,6 +167,39 @@ class FixtureTests(unittest.TestCase):
                         manifest["path_taps"], manifest["path_change"]["path_taps"]
                     )
 
+    def test_scenarios_exercise_distinct_physical_challenges(self):
+        with tempfile.TemporaryDirectory() as temp:
+            manifests = {}
+            echoes = {}
+            for scenario in (
+                "baseline",
+                "headphones-on-mic",
+                "long-delay",
+                "drift",
+                "gain-change",
+            ):
+                folder = Path(temp) / scenario
+                manifests[scenario] = generator.generate_scenario(
+                    scenario, folder, sr=8000, seconds=0.8
+                )
+                echoes[scenario] = samples(folder / "echo_only.wav")
+            self.assertEqual(
+                manifests["long-delay"]["reference_to_mic_base_delay_samples"], 1920
+            )
+            self.assertLess(
+                manifests["headphones-on-mic"]["reference_to_mic_base_delay_samples"],
+                80,
+            )
+            self.assertGreater(
+                sum(x * x for x in echoes["headphones-on-mic"]),
+                sum(x * x for x in echoes["baseline"]),
+            )
+            self.assertAlmostEqual(manifests["drift"]["drift_ppm"], 533.3333333333334)
+            self.assertEqual(
+                manifests["gain-change"]["gain_change"],
+                {"sample": 3200, "multiplier": 1.65},
+            )
+
     def test_microphone_mixture_noise_and_clipping(self):
         with tempfile.TemporaryDirectory() as temp:
             for scenario in generator.SCENARIOS:

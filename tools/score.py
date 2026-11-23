@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Score actual processed PCM16 WAV against deterministic fixture ground truth.
 
-Example: python tools/score.py --fixture build/fixtures/baseline \
+Example: python3 tools/score.py --fixture build/fixtures/baseline \
     --processed build/processed.wav --latency-samples 0
 
 Latency is a required nonnegative integer: processed[t + latency] corresponds to
@@ -94,6 +94,8 @@ def strict_integer(value: object, field: str, minimum: int = 0) -> int:
 def score(fixture: Path, processed: Path, latency_samples: int) -> dict:
     latency = strict_integer(latency_samples, "latency_samples")
     manifest = json.loads((fixture / "manifest.json").read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ScoreError("manifest must be a JSON object")
     if manifest.get("schema") != 2:
         raise ScoreError("schema 2 with explicit evaluation_windows is required")
     rate = strict_integer(manifest.get("sample_rate_hz"), "sample_rate_hz", 1)
@@ -107,10 +109,16 @@ def score(fixture: Path, processed: Path, latency_samples: int) -> dict:
     windows = manifest.get("evaluation_windows")
     if not isinstance(windows, list):
         raise ScoreError("evaluation_windows must be a list")
+    if type(manifest.get("nonlinear_mic_clip", False)) is not bool:
+        raise ScoreError("nonlinear_mic_clip must be a boolean")
     groups = {kind: [] for kind in ("far_only", "near_only", "double_talk")}
     occupied = []
     for window in windows:
-        if not isinstance(window, dict) or window.get("kind") not in groups:
+        if (
+            not isinstance(window, dict)
+            or not isinstance(window.get("kind"), str)
+            or window["kind"] not in groups
+        ):
             raise ScoreError("invalid evaluation window kind")
         start = strict_integer(window.get("start_sample"), "start_sample")
         end = strict_integer(window.get("end_sample"), "end_sample", 1)
