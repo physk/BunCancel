@@ -1,11 +1,15 @@
 #include "aec.hpp"
+#include "diagnostics.hpp"
 #include "editor.hpp"
+#include "host_clock.hpp"
 #include "reference_capture.hpp"
+#include "reference_timeline.hpp"
 
 #include "base/source/fstreamer.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "public.sdk/source/main/pluginfactory.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
 #include "public.sdk/source/vst/vstaudioeffect.h"
@@ -20,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifdef _WIN32
@@ -44,18 +49,46 @@ constexpr const char *statusRequest = "BunCancel.Status.Request";
 constexpr const char *statusReply = "BunCancel.Status.Reply";
 constexpr const char *statusAttribute = "status";
 
-enum class ProcessingStatus {
-  dry,
-  awaitingReference,
-  rateMismatch,
-  unsupportedFormat,
-  deviceError,
-  acquiringAlignment,
-  cancelling,
-  silentMicrophone,
-  noReference,
-  unavailable,
-  count
+constexpr const char *diagnosticsAttribute = "diagnostics.v1";
+
+// Atomic words avoid the C++ data race that a plain-data seqlock would have.
+// One writer publishes, readers make bounded attempts and retain their previous
+// observation on contention. Every operation is lock-free on the x64 target.
+class DiagnosticSnapshot {
+public:
+  void publish(const Diagnostics &value) noexcept {
+    std::array<std::uint64_t, wordCount> words{};
+    std::memcpy(words.data(), &value, sizeof(value));
+    sequence_.fetch_add(1, std::memory_order_acq_rel);
+    for (std::size_t i = 0; i < wordCount; ++i)
+      words_[i].store(words[i], std::memory_order_release);
+    sequence_.fetch_add(1, std::memory_order_release);
+  }
+
+  bool read(Diagnostics &value) const noexcept {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      const auto before = sequence_.load(std::memory_order_acquire);
+      if (before & 1)
+        continue;
+      std::array<std::uint64_t, wordCount> words{};
+      for (std::size_t i = 0; i < wordCount; ++i)
+        words[i] = words_[i].load(std::memory_order_relaxed);
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (before == sequence_.load(std::memory_order_relaxed) && before != 0) {
+        std::memcpy(static_cast<void *>(&value), words.data(), sizeof(value));
+        return true;
+      }
+    }
+    return false;
+  }
+
+private:
+  static_assert(std::is_trivially_copyable_v<Diagnostics>);
+  static_assert(std::atomic<std::uint64_t>::is_always_lock_free);
+  static constexpr std::size_t wordCount =
+      (sizeof(Diagnostics) + sizeof(std::uint64_t) - 1) / sizeof(std::uint64_t);
+  std::array<std::atomic<std::uint64_t>, wordCount> words_{};
+  std::atomic<std::uint64_t> sequence_{};
 };
 
 std::vector<capture::Endpoint> endpoints() {
@@ -154,8 +187,19 @@ public:
     status->appendString(STR16("Dry - silent microphone"));
     status->appendString(STR16("Dry - no reference selected"));
     status->appendString(STR16("Status unavailable - waiting for processor"));
+    status->appendString(STR16("Dry - bypassed"));
+    status->appendString(STR16("Ready - reference quiet"));
+    status->appendString(STR16("Dry - reference timing interrupted"));
+    status->appendString(STR16("Ready - no correlated echo"));
+    status->appendString(STR16("Ready - ambiguous echo timing"));
+    status->appendString(STR16("Ready - check microphone monitoring"));
+    status->appendString(STR16("Ready - echo delay outside supported range"));
+    status->appendString(STR16("Ready - aligned and monitoring"));
+    status->appendString(STR16("Ready - monitoring"));
     parameters.addParameter(status);
-    setParamNormalized(statusId, 1.0);
+    setParamNormalized(statusId,
+                       static_cast<double>(ProcessingStatus::unavailable) /
+                           (static_cast<int>(ProcessingStatus::count) - 1));
     return kResultOk;
   }
 
@@ -173,7 +217,9 @@ public:
     const auto now = std::chrono::steady_clock::now();
     if (!getPeer() || !haveStatus_ ||
         now - lastStatus_ > std::chrono::seconds(1))
-      setParamNormalized(statusId, 1.0);
+      setParamNormalized(statusId,
+                         static_cast<double>(ProcessingStatus::unavailable) /
+                             (static_cast<int>(ProcessingStatus::count) - 1));
     if (getPeer())
       sendMessageID(statusRequest);
   }
@@ -189,6 +235,20 @@ public:
               kResultOk ||
           status < 0 || status >= static_cast<int>(ProcessingStatus::count))
         return kResultFalse;
+      const void *binary = nullptr;
+      uint32 bytes = 0;
+      if (message->getAttributes()->getBinary(diagnosticsAttribute, binary,
+                                              bytes) != kResultOk ||
+          !binary || bytes != sizeof(Diagnostics))
+        return kResultFalse;
+      Diagnostics diagnostic;
+      std::memcpy(&diagnostic, binary, sizeof(diagnostic));
+      if (static_cast<std::uint32_t>(diagnostic.status) >=
+              static_cast<std::uint32_t>(ProcessingStatus::count) ||
+          static_cast<std::uint32_t>(diagnostic.alignment_reason) >
+              static_cast<std::uint32_t>(AlignmentReason::referenceMissing))
+        return kResultFalse;
+      diagnostics_.publish(diagnostic);
       setParamNormalized(statusId,
                          static_cast<double>(status) /
                              (static_cast<int>(ProcessingStatus::count) - 1));
@@ -201,7 +261,9 @@ public:
 
   tresult PLUGIN_API disconnect(IConnectionPoint *other) override {
     haveStatus_ = false;
-    setParamNormalized(statusId, 1.0);
+    setParamNormalized(statusId,
+                       static_cast<double>(ProcessingStatus::unavailable) /
+                           (static_cast<int>(ProcessingStatus::count) - 1));
     return EditController::disconnect(other);
   }
 
@@ -219,7 +281,16 @@ public:
     return kResultOk;
   }
 
+public:
+  bool readDiagnostic(Diagnostics &value) const {
+    return haveStatus_ && getPeer() &&
+           std::chrono::steady_clock::now() - lastStatus_ <=
+               std::chrono::seconds(1) &&
+           diagnostics_.read(value);
+  }
+
 private:
+  DiagnosticSnapshot diagnostics_;
   bool haveStatus_ = false;
   std::chrono::steady_clock::time_point lastStatus_{};
   std::vector<capture::Endpoint> devices_;
@@ -228,6 +299,11 @@ private:
 void refreshStatus(EditController *controller) {
   if (controller)
     static_cast<Controller *>(controller)->refreshStatus();
+}
+
+bool readDiagnostics(EditController *controller, Diagnostics &snapshot) {
+  return controller &&
+         static_cast<Controller *>(controller)->readDiagnostic(snapshot);
 }
 
 class Processor final : public AudioEffect {
@@ -278,11 +354,27 @@ public:
       engine_ =
           std::make_unique<buncancel::Aec>(static_cast<int>(setup.sampleRate));
       reference_.resize(static_cast<size_t>(setup.maxSamplesPerBlock));
+      microphone_.resize(static_cast<size_t>(setup.maxSamplesPerBlock));
+      capture::ReferenceTimelineConfig config;
+      config.sample_rate = static_cast<std::uint32_t>(setup.sampleRate);
+      config.max_block_frames =
+          static_cast<std::uint32_t>(setup.maxSamplesPerBlock);
+      config.history_frames = static_cast<std::uint32_t>(setup.sampleRate * 2);
+      config.holdback_frames =
+          static_cast<std::uint32_t>(setup.sampleRate * 0.020);
+      timeline_ = std::make_unique<capture::ReferenceTimeline>(config);
     } catch (...) {
       engine_.reset();
       return kOutOfMemory;
     }
     rate_ = static_cast<uint32_t>(setup.sampleRate);
+    hostClock_ = HostClock(setup.sampleRate);
+#ifdef _WIN32
+    LARGE_INTEGER frequency{};
+    qpcScale_ = QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0
+                    ? 10000000.0 / static_cast<double>(frequency.QuadPart)
+                    : 0;
+#endif
     return AudioEffect::setupProcessing(setup);
   }
 
@@ -292,8 +384,14 @@ public:
         return kResultFalse;
       engine_->reset();
       lastReportedStatus_ = -1;
-      latestStatus_.store(ProcessingStatus::awaitingReference);
-      packetOffset_ = packet_.frame_count = 0;
+      timeline_->reset();
+      hostClock_.reset();
+      haveReference_ = false;
+      underruns_ = 0;
+      dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
+      rawReferenceRms_ = rawReferencePeak_ = 0;
+      rawReferenceQpc_ = 0;
+      waitingSinceQpc_ = 0;
       stopWorker();
       running_.store(true);
       try {
@@ -313,20 +411,73 @@ public:
         std::strcmp(message->getMessageID(), statusRequest) == 0) {
       // IConnectionPoint::notify is a UI-thread API. Only atomic observations
       // cross from process(); message allocation and host callbacks stay here.
-      auto status = latestStatus_.load();
+      Diagnostics diagnostic;
+      if (!diagnostics_.read(diagnostic))
+        diagnostic.status = ProcessingStatus::unavailable;
+      bool staleObservation = false;
+#ifdef _WIN32
+      LARGE_INTEGER now{};
+      if (qpcScale_ > 0 && QueryPerformanceCounter(&now)) {
+        const auto currentQpc = static_cast<std::uint64_t>(
+            static_cast<double>(now.QuadPart) * qpcScale_);
+        staleObservation =
+            diagnostic.observation_qpc_100ns &&
+            currentQpc > diagnostic.observation_qpc_100ns &&
+            currentQpc - diagnostic.observation_qpc_100ns > 10000000;
+      }
+#endif
+      const bool sourceChanged = selected_.load() != connected_.load();
+      if (!enabled_.load())
+        diagnostic.status = ProcessingStatus::dry;
+      if (bypass_.load())
+        diagnostic.status = ProcessingStatus::bypassed;
+      else if (enabled_.load() && selected_.load() == 0)
+        diagnostic.status = ProcessingStatus::noReference;
+      else if (enabled_.load() && (!running_.load() || !processing_.load() ||
+                                   staleObservation || sourceChanged))
+        diagnostic.status = ProcessingStatus::awaitingReference;
+      else if (enabled_.load()) {
+        switch (capture_.status()) {
+        case capture::CaptureStatus::device_error:
+          diagnostic.status = ProcessingStatus::deviceError;
+          break;
+        case capture::CaptureStatus::rate_mismatch:
+          diagnostic.status = ProcessingStatus::rateMismatch;
+          break;
+        case capture::CaptureStatus::unsupported_format:
+          diagnostic.status = ProcessingStatus::unsupportedFormat;
+          break;
+        default:
+          break;
+        }
+      }
       if (!enabled_.load() || bypass_.load())
-        status = ProcessingStatus::dry;
-      else if (selected_.load() == 0)
-        status = ProcessingStatus::noReference;
-      else if (!running_.load() || !processing_.load() ||
-               status == ProcessingStatus::dry)
-        status = ProcessingStatus::awaitingReference;
+        diagnostic.aligned = diagnostic.reducing = false;
+      if (sourceChanged) {
+        diagnostic.reference_available = false;
+        diagnostic.reference_rms = diagnostic.reference_peak = 0;
+        diagnostic.reference_sample_rate = 0;
+        diagnostic.timing_valid = diagnostic.candidate_valid = false;
+        diagnostic.candidate_confirmed = false;
+        diagnostic.aligned = diagnostic.reducing = false;
+      }
+      if (!running_.load() || !processing_.load() || staleObservation) {
+        diagnostic.mic_available = false;
+        diagnostic.reference_available = false;
+        diagnostic.timing_valid = false;
+        diagnostic.candidate_valid = false;
+        diagnostic.aligned = diagnostic.reducing = false;
+      }
       auto reply = owned(allocateMessage());
       if (!reply || !reply->getAttributes())
         return kResultFalse;
       reply->setMessageID(statusReply);
       if (reply->getAttributes()->setInt(
-              statusAttribute, static_cast<int64>(status)) != kResultOk)
+              statusAttribute, static_cast<int64>(diagnostic.status)) !=
+          kResultOk)
+        return kResultFalse;
+      if (reply->getAttributes()->setBinary(diagnosticsAttribute, &diagnostic,
+                                            sizeof(diagnostic)) != kResultOk)
         return kResultFalse;
       return sendMessage(reply);
     }
@@ -335,6 +486,13 @@ public:
 
   tresult PLUGIN_API setProcessing(TBool state) override {
     processing_.store(state != 0);
+    if (!state) {
+      hostClock_.reset();
+      if (timeline_)
+        timeline_->reset();
+      if (engine_)
+        engine_->reset();
+    }
     return kResultOk;
   }
 
@@ -389,7 +547,27 @@ public:
       }
     }
     if (data.numSamples == 0 || data.numInputs == 0 || data.numOutputs == 0) {
-      reportStatus(data, false);
+      Diagnostics diagnostic;
+      diagnostics_.read(diagnostic);
+      diagnostic.host_sample_rate = rate_;
+      diagnostic.bypassed = bypass_.load();
+      if (selected_.load() != audioSelection_) {
+        diagnostic.reference_available = false;
+        diagnostic.reference_rms = diagnostic.reference_peak = 0;
+        diagnostic.reference_sample_rate = 0;
+        diagnostic.timing_valid = diagnostic.candidate_valid = false;
+        diagnostic.candidate_confirmed = false;
+        diagnostic.underruns = diagnostic.dropouts = 0;
+      }
+      if (!enabled_.load() || bypass_.load())
+        diagnostic.aligned = diagnostic.reducing = false;
+      if (bypass_.load())
+        diagnostic.status = ProcessingStatus::bypassed;
+      else if (!enabled_.load())
+        diagnostic.status = ProcessingStatus::dry;
+      else if (!selected_.load())
+        diagnostic.status = ProcessingStatus::noReference;
+      publishDiagnostics(data, diagnostic);
       return kResultOk;
     }
     if (data.symbolicSampleSize != kSample32 || data.numInputs < 1 ||
@@ -401,114 +579,201 @@ public:
     float *out = data.outputs[0].channelBuffers32[0];
     if (!mic || !out || data.numSamples < 0)
       return kResultFalse;
-    if (data.inputs[0].silenceFlags & 1) {
-      std::fill_n(out, data.numSamples, 0.0f);
-      if (engine_ && !silent_)
-        engine_->reset();
-      silent_ = true;
-      packetOffset_ = packet_.frame_count = 0;
-      capture::ReferencePacket discarded;
-      for (int i = 0; i < 64 && capture_.pop(discarded); ++i) {
+    const auto frames = static_cast<std::size_t>(data.numSamples);
+    const bool fits = engine_ && timeline_ && frames <= reference_.size();
+    const bool hostSilent = (data.inputs[0].silenceFlags & 1) != 0;
+    Diagnostics diagnostic;
+    diagnostic.host_sample_rate = rate_;
+    diagnostic.reference_holdback_ms = 20;
+    diagnostic.bypassed = bypass_.load();
+    diagnostic.mic_available = true;
+    double micEnergy = 0;
+    for (std::size_t i = 0; i < frames; ++i) {
+      const float sample = hostSilent ? 0.0f : mic[i];
+      if (fits)
+        microphone_[i] = sample;
+      if (std::isfinite(sample)) {
+        micEnergy += static_cast<double>(sample) * sample;
+        diagnostic.mic_peak = std::max(diagnostic.mic_peak, std::abs(sample));
       }
-      data.outputs[0].silenceFlags = 1;
-      reportStatus(data, false, true);
-      return kResultOk;
     }
-    silent_ = false;
-    const bool usable =
-        engine_ && enabled_.load() && !bypass_.load() &&
-        selected_.load() == connected_.load() && connected_.load() > 0 &&
-        capture_.status() == capture::CaptureStatus::running &&
-        static_cast<size_t>(data.numSamples) <= reference_.size();
-    if (!usable) {
-      packetOffset_ = packet_.frame_count = 0;
-    }
+    diagnostic.mic_rms = static_cast<float>(std::sqrt(micEnergy / frames));
+    const bool micQuiet = diagnostic.mic_peak == 0;
+    const auto qpc = microphoneTime(data);
+    diagnostic.observation_qpc_100ns = callbackQpc_;
     const auto connection = captureEpoch_.load();
-    if (connection != audioConnection_) {
-      packetOffset_ = packet_.frame_count = 0;
+    const int selected = selected_.load();
+    if (connection != audioConnection_ || selected != audioSelection_) {
+      if (timeline_)
+        timeline_->reset();
       if (engine_)
         engine_->reset();
       audioConnection_ = connection;
+      audioSelection_ = selected;
+      haveReference_ = false;
+      underruns_ = 0;
+      dropoutBase_ = capture_.dropped_packets() + capture_.discontinuities();
+      rawReferenceRms_ = rawReferencePeak_ = 0;
+      rawReferenceQpc_ = 0;
+      waitingSinceQpc_ = 0;
     }
-    bool complete = usable;
-    for (int32 i = 0; complete && i < data.numSamples; ++i) {
-      if (packetOffset_ >= packet_.frame_count) {
-        if (!capture_.pop(packet_) || packet_.discontinuity ||
-            packet_.sample_rate != rate_ || packet_.channel_count < 1 ||
-            packet_.channel_count > 2 || packet_.frame_count == 0 ||
-            packet_.frame_count > 512 ||
-            (clock100ns_.load() > packet_.qpc_position_100ns &&
-             clock100ns_.load() - packet_.qpc_position_100ns > 1000000)) {
-          complete = false;
-          packetOffset_ = packet_.frame_count = 0;
-          break;
+    double referenceEnergy = 0;
+    std::size_t referenceSamples = 0;
+    float referencePeak = 0;
+    capture::ReferencePacket packet;
+    for (int drained = 0; drained < 64 && capture_.pop(packet); ++drained) {
+      // Meter the actual arriving source even when timeline recovery is dry.
+      if (packet.channel_count >= 1 && packet.channel_count <= 2 &&
+          packet.frame_count <= capture::ReferencePacket::max_frames) {
+        const auto samples = packet.frame_count * packet.channel_count;
+        for (std::uint32_t i = 0; i < samples; ++i) {
+          const float sample = packet.samples[i];
+          if (std::isfinite(sample)) {
+            referenceEnergy += static_cast<double>(sample) * sample;
+            referencePeak = std::max(referencePeak, std::abs(sample));
+          }
         }
-        packetOffset_ = 0;
-        if (packet_.generation != audioGeneration_ ||
-            (havePosition_ && packet_.device_position != expectedPosition_)) {
-          engine_->reset();
-          audioGeneration_ = packet_.generation;
-        }
-        expectedPosition_ = packet_.device_position + packet_.frame_count;
-        havePosition_ = true;
+        referenceSamples += samples;
+        rawReferenceQpc_ = packet.qpc_position_100ns;
       }
-      const auto index = packetOffset_++ * packet_.channel_count;
-      reference_[static_cast<size_t>(i)] =
-          packet_.channel_count == 2
-              ? 0.5f * (packet_.samples[index] + packet_.samples[index + 1])
-              : packet_.samples[index];
+      if (timeline_)
+        timeline_->push(packet);
     }
-    if (complete) {
-      engine_->process(mic, reference_.data(), out, data.numSamples);
-    } else if (engine_ &&
-               static_cast<size_t>(data.numSamples) <= reference_.size()) {
-      engine_->process(mic, nullptr, out, data.numSamples);
+    if (referenceSamples) {
+      rawReferenceRms_ =
+          static_cast<float>(std::sqrt(referenceEnergy / referenceSamples));
+      rawReferencePeak_ = referencePeak;
+    }
+    const auto captureStatus = capture_.status();
+    const bool connected = selected > 0 && selected == connected_.load() &&
+                           captureStatus == capture::CaptureStatus::running;
+    diagnostic.reference_available =
+        connected && rawReferenceQpc_ && callbackQpc_ &&
+        std::abs(static_cast<double>(callbackQpc_) -
+                 static_cast<double>(rawReferenceQpc_)) < 1000000;
+    diagnostic.reference_rms =
+        diagnostic.reference_available ? rawReferenceRms_ : 0;
+    diagnostic.reference_peak =
+        diagnostic.reference_available ? rawReferencePeak_ : 0;
+    diagnostic.reference_sample_rate =
+        selected == connected_.load() ? capture_.actual_sample_rate() : 0;
+    capture::TimelineResult timing;
+    if (fits && connected && qpc)
+      timing = timeline_->render(qpc, static_cast<std::uint32_t>(frames),
+                                 reference_.data());
+    if (timing.reset_required && engine_)
+      engine_->reset();
+    diagnostic.timing_valid = timing.latest_packet_qpc_100ns != 0 && qpc != 0;
+    if (diagnostic.timing_valid)
+      diagnostic.timestamp_offset_ms =
+          (static_cast<double>(qpc) -
+           static_cast<double>(timing.latest_packet_qpc_100ns)) /
+          10000;
+    const bool enabled = enabled_.load() && !bypass_.load();
+    const bool complete = fits && connected && timing.usable;
+    if (connected && !waitingSinceQpc_)
+      waitingSinceQpc_ = callbackQpc_;
+    const bool prefillExpired = waitingSinceQpc_ &&
+                                callbackQpc_ > waitingSinceQpc_ &&
+                                callbackQpc_ - waitingSinceQpc_ > 1000000;
+    const bool interrupted =
+        connected && !complete && (haveReference_ || prefillExpired);
+    if (complete)
+      haveReference_ = true;
+    else if (interrupted)
+      ++underruns_;
+    if (fits) {
+      engine_->process(microphone_.data(),
+                       complete && enabled ? reference_.data() : nullptr, out,
+                       data.numSamples);
+    } else if (hostSilent) {
+      std::fill_n(out, frames, 0.0f);
     } else {
-      std::copy_n(mic, data.numSamples, out);
+      std::copy_n(mic, frames, out);
     }
-    data.outputs[0].silenceFlags = data.inputs[0].silenceFlags;
-    reportStatus(data, complete);
+    // Bypass and missing-reference paths preserve the raw microphone exactly.
+    // The DSP still observes the missing reference to invalidate old
+    // adaptation.
+    if ((!complete || !enabled) && !hostSilent)
+      std::copy_n(mic, frames, out);
+    // AEC must never synthesize output when the microphone is actually silent.
+    if (micQuiet)
+      std::fill_n(out, frames, 0.0f);
+    data.outputs[0].silenceFlags = micQuiet ? 1 : 0;
+    if (engine_) {
+      const auto alignment = engine_->diagnostics();
+      diagnostic.alignment_reason =
+          static_cast<AlignmentReason>(alignment.state);
+      diagnostic.candidate_valid = alignment.peakValid;
+      diagnostic.candidate_confirmed = alignment.candidateValid;
+      const auto observedLag = alignment.candidateValid
+                                   ? alignment.candidateLagSamples
+                                   : alignment.peakLagSamples;
+      diagnostic.candidate_delay_ms = 1000.0 * observedLag / rate_ + 20;
+      diagnostic.correlation = alignment.peakCorrelation;
+      diagnostic.aligned = complete && enabled && engine_->aligned();
+      diagnostic.reduction_db = alignment.reductionDb;
+      diagnostic.reducing = diagnostic.aligned && alignment.reductionValid &&
+                            alignment.reductionDb > 0 && !micQuiet;
+    }
+    diagnostic.underruns = underruns_;
+    const auto totalDropouts =
+        capture_.dropped_packets() + capture_.discontinuities();
+    diagnostic.dropouts =
+        totalDropouts >= dropoutBase_ ? totalDropouts - dropoutBase_ : 0;
+    ProcessingObservation observation;
+    observation.enabled = enabled_.load();
+    observation.bypassed = bypass_.load();
+    observation.selected = selected != 0;
+    observation.connected = connected;
+    observation.processing = processing_.load();
+    observation.format_supported =
+        captureStatus != capture::CaptureStatus::unsupported_format;
+    observation.rate_matched =
+        captureStatus != capture::CaptureStatus::rate_mismatch;
+    observation.device_error =
+        captureStatus == capture::CaptureStatus::device_error;
+    observation.interrupted = interrupted;
+    observation.reducing = diagnostic.reducing;
+    diagnostic.status = selectProcessingStatus(observation);
+    publishDiagnostics(data, diagnostic);
     return kResultOk;
   }
 
 private:
-  void reportStatus(ProcessData &data, bool processed,
-                    bool silent = false) noexcept {
-    auto status = ProcessingStatus::awaitingReference;
-    if (!enabled_.load() || bypass_.load()) {
-      status = ProcessingStatus::dry;
-    } else if (selected_.load() == 0) {
-      status = ProcessingStatus::noReference;
-    } else {
-      switch (capture_.status()) {
-      case capture::CaptureStatus::rate_mismatch:
-        status = ProcessingStatus::rateMismatch;
-        break;
-      case capture::CaptureStatus::unsupported_format:
-        status = ProcessingStatus::unsupportedFormat;
-        break;
-      case capture::CaptureStatus::device_error:
-        status = ProcessingStatus::deviceError;
-        break;
-      case capture::CaptureStatus::running:
-        if (selected_.load() == connected_.load() && connected_.load() > 0) {
-          status = silent      ? ProcessingStatus::silentMicrophone
-                   : processed ? (engine_ && engine_->aligned()
-                                      ? ProcessingStatus::cancelling
-                                      : ProcessingStatus::acquiringAlignment)
-                               : ProcessingStatus::awaitingReference;
-        }
-        break;
-      default:
-        break;
-      }
+  std::uint64_t microphoneTime(const ProcessData &data) noexcept {
+    std::uint64_t now = 0;
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    if (qpcScale_ > 0 && QueryPerformanceCounter(&counter))
+      now = static_cast<std::uint64_t>(static_cast<double>(counter.QuadPart) *
+                                       qpcScale_);
+#endif
+    callbackQpc_ = now;
+    if (!now)
+      return 0;
+    const bool continuousValid =
+        data.processContext &&
+        (data.processContext->state & ProcessContext::kContTimeValid);
+    const auto timing = hostClock_.observe(
+        now, static_cast<std::uint32_t>(data.numSamples), continuousValid,
+        continuousValid ? data.processContext->continousTimeSamples : 0);
+    if (timing.reset_required) {
+      if (timeline_)
+        timeline_->reset();
+      if (engine_)
+        engine_->reset();
+      haveReference_ = false;
     }
-    latestStatus_.store(status);
-    const auto value = static_cast<int>(status);
+    return timing.microphone_start_qpc_100ns;
+  }
+
+  void publishDiagnostics(ProcessData &data,
+                          const Diagnostics &diagnostic) noexcept {
+    diagnostics_.publish(diagnostic);
+    const auto value = static_cast<int>(diagnostic.status);
     if (!data.outputParameterChanges || value == lastReportedStatus_)
       return;
-    // The host owns the output-change storage supplied for this callback.
-    // No SDK parameter objects or strings are created on the audio thread.
     int32 queueIndex = 0;
     auto *queue =
         data.outputParameterChanges->addParameterData(statusId, queueIndex);
@@ -532,15 +797,6 @@ private:
   void controlLoop() noexcept {
     int previous = -1;
     while (running_.load()) {
-#ifdef _WIN32
-      LARGE_INTEGER counter{}, frequency{};
-      if (QueryPerformanceCounter(&counter) &&
-          QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0) {
-        clock100ns_.store(
-            static_cast<uint64_t>(static_cast<long double>(counter.QuadPart) *
-                                  10000000.0L / frequency.QuadPart));
-      }
-#endif
       const int requested =
           enabled_.load() && !bypass_.load() ? selected_.load() : 0;
       if (requested != previous) {
@@ -567,19 +823,20 @@ private:
   std::vector<capture::Endpoint> devices_;
   capture::ReferenceCapture capture_;
   std::unique_ptr<buncancel::Aec> engine_;
-  std::vector<float> reference_;
-  capture::ReferencePacket packet_{};
-  uint32_t packetOffset_ = 0;
-  uint64_t audioGeneration_ = 0, expectedPosition_ = 0;
-  bool havePosition_ = false;
-  bool silent_ = false;
+  std::vector<float> reference_, microphone_;
+  std::unique_ptr<capture::ReferenceTimeline> timeline_;
+  DiagnosticSnapshot diagnostics_;
   int lastReportedStatus_ = -1;
-  static_assert(std::atomic<ProcessingStatus>::is_always_lock_free);
-  std::atomic<ProcessingStatus> latestStatus_{ProcessingStatus::dry};
   std::atomic<bool> processing_{false};
-  std::atomic<uint64_t> clock100ns_{0};
-  uint64_t audioConnection_ = 0;
-  std::atomic<uint64_t> captureEpoch_{0};
+  std::uint64_t audioConnection_ = 0;
+  int audioSelection_ = 0;
+  std::atomic<std::uint64_t> captureEpoch_{0};
+  std::uint64_t underruns_ = 0, dropoutBase_ = 0, rawReferenceQpc_ = 0;
+  std::uint64_t callbackQpc_ = 0, waitingSinceQpc_ = 0;
+  float rawReferenceRms_ = 0, rawReferencePeak_ = 0;
+  bool haveReference_ = false;
+  HostClock hostClock_;
+  double qpcScale_ = 0;
   uint32_t rate_ = 48000;
   std::atomic<int> selected_{0}, connected_{0};
   std::atomic<bool> enabled_{false}, bypass_{false}, running_{false};
@@ -595,10 +852,10 @@ using namespace Steinberg::Vst;
 BEGIN_FACTORY_DEF("BunCancel", "", "")
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::processorId),
            PClassInfo::kManyInstances, kVstAudioEffectClass,
-           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.1",
+           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.2",
            kVstVersionString, buncancel::plugin::Processor::create)
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::controllerId),
            PClassInfo::kManyInstances, kVstComponentControllerClass,
-           "BunCancel Controller", 0, "", "0.1.1", kVstVersionString,
+           "BunCancel Controller", 0, "", "0.1.2", kVstVersionString,
            buncancel::plugin::Controller::create)
 END_FACTORY

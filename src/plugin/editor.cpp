@@ -1,4 +1,5 @@
 #include "editor.hpp"
+#include "diagnostics.hpp"
 
 #include "public.sdk/source/common/pluginview.h"
 #include "public.sdk/source/vst/vsteditcontroller.h"
@@ -48,10 +49,129 @@ std::wstring displayString(EditController &controller, ParamID id,
   return result;
 }
 
+std::wstring level(float amplitude) {
+  if (!std::isfinite(amplitude) || amplitude < 0.0f)
+    return L"unavailable";
+  if (amplitude == 0.0f)
+    return L"-inf (silence)";
+  wchar_t text[48]{};
+  std::swprintf(text, std::size(text), L"%.1f", 20.0 * std::log10(amplitude));
+  return text;
+}
+
+std::wstring meter(const wchar_t *name, bool available, float rms, float peak) {
+  if (!available)
+    return std::wstring(name) + L": unavailable";
+  return std::wstring(name) + L": RMS " + level(rms) + L" / peak " +
+         level(peak) + L" dBFS";
+}
+
+const wchar_t *nextAction(ProcessingStatus status) {
+  switch (status) {
+  case ProcessingStatus::dry:
+    return L"Next: select a playback reference, then enable experimental AEC.";
+  case ProcessingStatus::bypassed:
+    return L"Next: turn off bypass to resume experimental AEC.";
+  case ProcessingStatus::noReference:
+    return L"Next: select the playback device or mix that leaks into the mic.";
+  case ProcessingStatus::rateMismatch:
+    return L"Next: set the host and playback device to the same sample rate.";
+  case ProcessingStatus::unsupportedFormat:
+    return L"Next: choose a supported playback format or another reference.";
+  case ProcessingStatus::deviceError:
+    return L"Next: reconnect the playback device, then reselect the reference.";
+  case ProcessingStatus::silentMicrophone:
+    return L"No action required. If speech is expected, check the host mic "
+           L"input and gain.";
+  case ProcessingStatus::silentReference:
+    return L"No action required. The reference is connected and currently "
+           L"quiet.";
+  case ProcessingStatus::interruptedReference:
+    return L"Next: check device stability and host buffer size; mic stays dry.";
+  case ProcessingStatus::selfMonitoring:
+    return L"Next: remove microphone monitoring from the selected playback "
+           L"mix.";
+  case ProcessingStatus::delayOutOfRange:
+    return L"Next: reduce playback latency or choose a more direct reference.";
+  case ProcessingStatus::insufficientCorrelation:
+    return L"No action required. Monitoring; no correlated echo detected.";
+  case ProcessingStatus::ambiguousAlignment:
+    return L"No action required. Monitoring while the echo delay is ambiguous.";
+  case ProcessingStatus::awaitingReference:
+    return L"Next: check that the selected reference is connected and host "
+           L"processing is running.";
+  case ProcessingStatus::acquiringAlignment:
+    return L"No action required. Monitoring while alignment settles.";
+  case ProcessingStatus::aligned:
+    return L"Next: check residual echo while speaking; alignment alone does "
+           L"not prove reduction.";
+  case ProcessingStatus::readyMonitoring:
+    return L"No action required. Ready to monitor playback and preserve your "
+           L"microphone.";
+  case ProcessingStatus::cancelling:
+    return L"Next: listen for voice retention during playback; level reduction "
+           L"is not ERLE.";
+  case ProcessingStatus::unavailable:
+  case ProcessingStatus::count:
+    return L"Next: start host processing or reconnect the processor to receive "
+           L"diagnostics.";
+  }
+  return L"Next: check the host audio connection.";
+}
+
+std::wstring diagnosticsText(const Diagnostics &value, bool available) {
+  std::wstring result = meter(L"Mic", available && value.mic_available,
+                              value.mic_rms, value.mic_peak);
+  result +=
+      L"\r\n" + meter(L"Reference", available && value.reference_available,
+                      value.reference_rms, value.reference_peak);
+  if (!available)
+    return result +
+           L"\r\nRates: unavailable\r\nGaps / underruns: unavailable"
+           L"\r\nPeak correlation: unavailable"
+           L"\r\nCandidate lag: unavailable\r\nPacket timing: unavailable";
+  wchar_t text[256]{};
+  if (value.host_sample_rate > 0.0)
+    std::swprintf(text, std::size(text), L"\r\nHost: %.0f Hz / capture: ",
+                  value.host_sample_rate);
+  else
+    std::swprintf(text, std::size(text), L"\r\nHost: unavailable / capture: ");
+  result += text;
+  result += value.reference_sample_rate
+                ? std::to_wstring(value.reference_sample_rate) + L" Hz"
+                : L"unavailable";
+  std::swprintf(text, std::size(text), L"\r\nGaps: %llu / underruns: %llu",
+                static_cast<unsigned long long>(value.dropouts),
+                static_cast<unsigned long long>(value.underruns));
+  result += text;
+  if (value.candidate_valid) {
+    std::swprintf(text, std::size(text),
+                  L"\r\nPeak correlation: %.3f\r\nCandidate lag: %.2f ms%ls",
+                  value.correlation, value.candidate_delay_ms,
+                  value.aligned               ? L" (aligned)"
+                  : value.candidate_confirmed ? L" (confirmed)"
+                                              : L" (unconfirmed)");
+    result += text;
+  } else {
+    result +=
+        L"\r\nPeak correlation: unavailable\r\nCandidate lag: unavailable";
+  }
+  if (value.timing_valid) {
+    std::swprintf(
+        text, std::size(text),
+        L"\r\nMic start minus latest packet: %+.2f ms / holdback: %.0f ms",
+        value.timestamp_offset_ms, value.reference_holdback_ms);
+    result += text;
+  } else {
+    result += L"\r\nPacket timing: unavailable";
+  }
+  return result;
+}
+
 class NativeEditor final : public CPluginView {
 public:
   explicit NativeEditor(EditController *controller) : controller_(controller) {
-    rect = ViewRect(0, 0, 620, 400);
+    rect = ViewRect(0, 0, 660, 600);
   }
 
   ~NativeEditor() override { detachWindow(); }
@@ -137,7 +257,7 @@ public:
     size->right =
         size->left + std::max(size->getWidth(), MulDiv(560, dpi_, 96));
     size->bottom =
-        size->top + std::max(size->getHeight(), MulDiv(380, dpi_, 96));
+        size->top + std::max(size->getHeight(), MulDiv(600, dpi_, 96));
     return kResultOk;
   }
 
@@ -168,12 +288,17 @@ private:
                       BS_AUTOCHECKBOX | WS_TABSTOP, bypassControlId);
     statusLabel_ = control(L"STATIC", L"Reference / AEC status", SS_LEFT, 0);
     status_ = control(L"STATIC", L"", SS_LEFT, statusControlId);
-    note_ = control(L"STATIC",
-                    L"Use a playback mix without microphone monitoring.\r\n"
-                    L"Missing reference keeps the microphone dry.",
-                    SS_LEFT, 0);
+    diagnostics_ = control(L"STATIC", L"", SS_LEFT, diagnosticsControlId);
+    action_ = control(L"STATIC", L"", SS_LEFT, actionControlId);
+    note_ =
+        control(L"STATIC",
+                L"Use a playback mix without microphone monitoring.\r\n"
+                L"Missing reference keeps the microphone dry.\r\n"
+                L"Timing = estimated mic start - reference packet start (QPC).",
+                SS_LEFT, 0);
     if (!title_ || !subtitle_ || !enable_ || !sourceLabel_ || !endpoint_ ||
-        !bypass_ || !statusLabel_ || !status_ || !note_)
+        !bypass_ || !statusLabel_ || !status_ || !diagnostics_ || !action_ ||
+        !note_)
       return false;
     ParameterInfo info{};
     if (controller_->getParameterInfoByTag(endpointId, info) != kResultOk ||
@@ -198,7 +323,7 @@ private:
     GetClientRect(window_, &bounds);
     // A host may decline a DPI resize; keep every control visible in that case.
     const auto scale =
-        std::min({dpi_ / 96.0, bounds.right / 560.0, bounds.bottom / 380.0});
+        std::min({dpi_ / 96.0, bounds.right / 560.0, bounds.bottom / 600.0});
     const auto pixel = [scale](int value) {
       return std::max(1, static_cast<int>(std::lround(value * scale)));
     };
@@ -207,8 +332,9 @@ private:
                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                             DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     if (font) {
-      for (auto child : {title_, subtitle_, enable_, sourceLabel_, endpoint_,
-                         bypass_, statusLabel_, status_, note_})
+      for (auto child :
+           {title_, subtitle_, enable_, sourceLabel_, endpoint_, bypass_,
+            statusLabel_, status_, diagnostics_, action_, note_})
         SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
       if (font_)
         DeleteObject(font_);
@@ -226,7 +352,9 @@ private:
     place(bypass_, 204, 28);
     place(statusLabel_, 250, 22);
     place(status_, 276, 28);
-    place(note_, 318, 60);
+    place(diagnostics_, 312, 150);
+    place(action_, 470, 56);
+    place(note_, 532, 60);
   }
 
   void refresh() {
@@ -247,12 +375,60 @@ private:
       SendMessageW(endpoint_, CB_SETCURSEL,
                    static_cast<WPARAM>(std::lround(value * endpointSteps_)), 0);
     }
+    Diagnostics snapshot;
+    const bool available = readDiagnostics(controller_, snapshot);
     auto text = displayString(*controller_, statusId,
                               controller_->getParamNormalized(statusId));
+    if (available && snapshot.status == ProcessingStatus::readyMonitoring) {
+      if (snapshot.mic_available && snapshot.mic_peak == 0.0f)
+        text = L"Ready - microphone quiet";
+      else if (snapshot.reference_available && snapshot.reference_peak == 0.0f)
+        text = L"Ready - reference quiet";
+      else if (snapshot.alignment_reason ==
+               AlignmentReason::insufficientCorrelation)
+        text = L"Ready - monitoring / no correlated echo";
+      else {
+        switch (snapshot.alignment_reason) {
+        case AlignmentReason::selfMonitoring:
+          text = L"Ready - monitoring / possible mic in reference";
+          break;
+        case AlignmentReason::delayOutOfRange:
+          text = L"Ready - monitoring / echo delay outside range";
+          break;
+        case AlignmentReason::ambiguous:
+          text = L"Ready - monitoring / ambiguous echo delay";
+          break;
+        case AlignmentReason::aligned:
+          text = L"Ready - aligned / no subtraction observed";
+          break;
+        default:
+          text = L"Ready - monitoring";
+          break;
+        }
+      }
+    }
     if (text != statusText_) {
       statusText_ = std::move(text);
       SetWindowTextW(status_, statusText_.c_str());
     }
+    const auto details = diagnosticsText(snapshot, available);
+    if (details != diagnosticsText_) {
+      diagnosticsText_ = details;
+      SetWindowTextW(diagnostics_, details.c_str());
+    }
+    auto actionStatus =
+        available ? snapshot.status : ProcessingStatus::unavailable;
+    if (available && snapshot.status == ProcessingStatus::readyMonitoring) {
+      if (snapshot.mic_available && snapshot.mic_peak == 0.0f)
+        actionStatus = ProcessingStatus::silentMicrophone;
+      else if (snapshot.reference_available && snapshot.reference_peak == 0.0f)
+        actionStatus = ProcessingStatus::silentReference;
+      else if (snapshot.alignment_reason == AlignmentReason::selfMonitoring)
+        actionStatus = ProcessingStatus::selfMonitoring;
+      else if (snapshot.alignment_reason == AlignmentReason::delayOutOfRange)
+        actionStatus = ProcessingStatus::delayOutOfRange;
+    }
+    SetWindowTextW(action_, nextAction(actionStatus));
   }
 
   void edit(ParamID id, ParamValue value) {
@@ -268,7 +444,7 @@ private:
   void requestDpiSize(bool force = false) {
     if (!plugFrame)
       return;
-    ViewRect desired(0, 0, MulDiv(620, dpi_, 96), MulDiv(400, dpi_, 96));
+    ViewRect desired(0, 0, MulDiv(660, dpi_, 96), MulDiv(600, dpi_, 96));
     if (force || desired.getWidth() != rect.getWidth() ||
         desired.getHeight() != rect.getHeight())
       plugFrame->resizeView(this, &desired);
@@ -280,7 +456,7 @@ private:
     window_ = nullptr;
     systemWindow = nullptr;
     title_ = subtitle_ = enable_ = sourceLabel_ = endpoint_ = bypass_ =
-        statusLabel_ = status_ = note_ = nullptr;
+        statusLabel_ = status_ = diagnostics_ = action_ = note_ = nullptr;
     if (font_) {
       DeleteObject(font_);
       font_ = nullptr;
@@ -290,6 +466,7 @@ private:
       classRegistered_ = false;
     }
     statusText_.clear();
+    diagnosticsText_.clear();
   }
 
   static LRESULT CALLBACK windowProcedure(HWND window, UINT message,
@@ -361,6 +538,7 @@ private:
   HWND title_ = nullptr, subtitle_ = nullptr, enable_ = nullptr;
   HWND sourceLabel_ = nullptr, endpoint_ = nullptr, bypass_ = nullptr;
   HWND statusLabel_ = nullptr, status_ = nullptr, note_ = nullptr;
+  HWND diagnostics_ = nullptr, action_ = nullptr;
   HINSTANCE module_ = nullptr;
   HFONT font_ = nullptr;
   wchar_t className_[80]{};
@@ -368,6 +546,7 @@ private:
   UINT dpi_ = 96;
   int32 endpointSteps_ = 0;
   std::wstring statusText_;
+  std::wstring diagnosticsText_;
 };
 } // namespace
 

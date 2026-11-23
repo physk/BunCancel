@@ -68,6 +68,8 @@ public:
   bool pop(ReferencePacket &packet) noexcept;
   CaptureStatus status() const noexcept;
   std::uint64_t dropped_packets() const noexcept;
+  std::uint64_t discontinuities() const noexcept;
+  std::uint32_t actual_sample_rate() const noexcept;
 
 private:
   struct Impl;

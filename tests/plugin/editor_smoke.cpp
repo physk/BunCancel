@@ -31,6 +31,7 @@ constexpr ParamID enabledId = 0, endpointId = 1, bypassId = 2, statusId = 3;
 // linked.
 constexpr int enableControlId = 1001, endpointControlId = 1002;
 constexpr int bypassControlId = 1003, statusControlId = 1004;
+constexpr int diagnosticsControlId = 1005, actionControlId = 1006;
 
 void require(bool value, const char *message) {
   if (!value)
@@ -246,6 +247,25 @@ void dryProcessor(IComponent *component, IAudioProcessor *processor,
           "processor state did not preserve dry configuration");
 }
 
+void silentDryBlock(IAudioProcessor *processor) {
+  std::array<float, 128> mic{}, output{};
+  output.fill(0.25f);
+  float *inputChannel = mic.data(), *outputChannel = output.data();
+  AudioBusBuffers input{}, out{};
+  input.numChannels = out.numChannels = 1;
+  input.channelBuffers32 = &inputChannel;
+  out.channelBuffers32 = &outputChannel;
+  ProcessData data{};
+  data.processMode = kRealtime;
+  data.symbolicSampleSize = kSample32;
+  data.numSamples = static_cast<int32>(mic.size());
+  data.numInputs = data.numOutputs = 1;
+  data.inputs = &input;
+  data.outputs = &out;
+  require(processor->process(data) == kResultOk && mic == output,
+          "silent missing-reference block was not dry");
+}
+
 void editor(IComponent *component, IEditController *controller,
             Handler &handler, HWND host, IConnectionPoint *controllerConnection,
             IConnectionPoint *processorConnection) {
@@ -280,6 +300,8 @@ void editor(IComponent *component, IEditController *controller,
   const HWND endpoint = findControl(host, endpointControlId);
   const HWND bypass = findControl(host, bypassControlId);
   const HWND status = findControl(host, statusControlId);
+  const HWND diagnostics = findControl(host, diagnosticsControlId);
+  const HWND action = findControl(host, actionControlId);
   require(text(enable) == L"Enable experimental AEC", "enable label is wrong");
   require(text(bypass) == L"Bypass (dry microphone)", "bypass label is wrong");
   require(!text(status).empty(), "status label is empty");
@@ -328,7 +350,7 @@ void editor(IComponent *component, IEditController *controller,
   }
   std::cout << "Enumerated playback-reference endpoints: "
             << endpointInfo.stepCount << '\n';
-  for (HWND control : {enable, endpoint, bypass, status}) {
+  for (HWND control : {enable, endpoint, bypass, status, diagnostics, action}) {
     RECT client{}, bounds{};
     GetClientRect(GetParent(control), &client);
     GetWindowRect(control, &bounds);
@@ -350,6 +372,30 @@ void editor(IComponent *component, IEditController *controller,
   refresh(status);
   require(text(status) == L"Dry - no reference selected",
           "connected processor no-reference status did not reach editor");
+  const auto liveDetails = text(diagnostics);
+  require(
+      liveDetails.find(L"Mic: RMS -9.4 / peak -5.0 dBFS") !=
+              std::wstring::npos &&
+          liveDetails.find(L"peak ") != std::wstring::npos &&
+          liveDetails.find(L"dBFS") != std::wstring::npos &&
+          liveDetails.find(L"Reference: unavailable") != std::wstring::npos &&
+          liveDetails.find(L"Host: 48000 Hz") != std::wstring::npos &&
+          liveDetails.find(L"Gaps:") != std::wstring::npos &&
+          liveDetails.find(L"underruns:") != std::wstring::npos &&
+          liveDetails.find(L"Peak correlation: unavailable") !=
+              std::wstring::npos &&
+          liveDetails.find(L"Candidate lag: unavailable") != std::wstring::npos,
+      "real processor diagnostics did not reach the editor");
+  require(text(action).find(L"select the playback device") !=
+              std::wstring::npos,
+          "missing reference has no corrective action");
+  silentDryBlock(handler.processor);
+  refresh(status);
+  require(text(diagnostics).find(L"Mic: RMS -inf (silence)") !=
+                  std::wstring::npos &&
+              text(diagnostics).find(L"Reference: unavailable") !=
+                  std::wstring::npos,
+          "silent microphone was confused with unavailable reference");
   require(SendMessageW(endpoint, CB_GETCURSEL, 0, 0) == 0,
           "missing reference is not visibly selected as None");
   require(SendMessageW(enable, BM_GETCHECK, 0, 0) == BST_CHECKED,
@@ -389,8 +435,10 @@ void editor(IComponent *component, IEditController *controller,
           "restored endpoint selection is not visible");
 
   refresh(status);
-  require(text(status) == L"Dry - AEC off or bypassed",
-          "status update did not refresh");
+  require(text(status) == L"Dry - bypassed",
+          "bypass status update did not refresh");
+  require(text(action).find(L"turn off bypass") != std::wstring::npos,
+          "bypass corrective action did not refresh");
   ViewRect resized(0, 0, 760, 480);
   require(view->canResize() == kResultOk &&
               view->checkSizeConstraint(&resized) == kResultOk &&
@@ -403,11 +451,16 @@ void editor(IComponent *component, IEditController *controller,
   refresh(status);
   require(text(status) == L"Status unavailable - waiting for processor",
           "disconnected processor retained a misleading status");
+  require(
+      text(diagnostics).find(L"Mic: unavailable") != std::wstring::npos &&
+          text(diagnostics).find(L"Rates: unavailable") != std::wstring::npos &&
+          text(action).find(L"reconnect the processor") != std::wstring::npos,
+      "disconnect retained live diagnostics or omitted recovery guidance");
   require(processorConnection->connect(controllerConnection) == kResultOk &&
               controllerConnection->connect(processorConnection) == kResultOk,
           "status reconnect failed");
   refresh(status);
-  require(text(status) == L"Dry - AEC off or bypassed",
+  require(text(status) == L"Dry - bypassed",
           "status did not recover after reconnect");
   require(view->removed() == kResultOk, "editor detach failed");
   view->setFrame(nullptr);
@@ -427,6 +480,12 @@ void editor(IComponent *component, IEditController *controller,
   require(SendMessageW(findControl(host, endpointControlId), CB_GETCURSEL, 0,
                        0) == savedSelection,
           "editor reopen lost restored endpoint selection");
+  require(
+      text(findControl(host, diagnosticsControlId)).find(L"Mic: RMS") !=
+              std::wstring::npos &&
+          text(findControl(host, actionControlId)).find(L"turn off bypass") !=
+              std::wstring::npos,
+      "editor reopen lost live diagnostics or bypass guidance");
   require(handler.events.empty(), "host updates/reopen emitted user gestures");
   require(view->removed() == kResultOk, "reopened editor detach failed");
   view->setFrame(nullptr);

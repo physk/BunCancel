@@ -6,7 +6,7 @@ integration; host/device and physical audio acceptance gates remain open.
 
 ## Install or upgrade the Windows bundle
 
-1. Use the editor-enabled build (plugin version 0.1.1). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
+1. Use the editor-enabled build (plugin version 0.1.2). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
 2. Close Wave Link and any other hosts using the plugin. Save the current host settings. In the VST3 search directory, the existing `BunCancel.vst3` may be a single file or a folder with that same name. Move the **entire existing item** to a backup directory outside the scan paths. Keep the backup until the upgrade works.
 3. Copy the **outer folder** from staging into the search directory. A typical resulting path is `C:\Program Files\Common Files\VST3\BunCancel.vst3\Contents\x86_64-win\BunCancel.vst3`. Leave the resources and inner binary together. Installing a second loose copy of the inner binary can make the host resolve the wrong plugin.
 4. Reopen the host, rescan if available, and open BunCancel's editor on the microphone chain. The editor should show the playback-reference picker, enable and bypass controls, and processing status. To roll back, close the host, move the new bundle out of the scan path and restore the backed-up item under its original name.
@@ -25,9 +25,14 @@ The Windows workflow also runs the SDK's `validator.exe` against the full bundle
 
 ## Reference selection and lifecycle
 
-A physical Wave Link 3 test confirmed that the previous bundle loaded but opened a blank editor window. The replacement controller provides its own VST3 editor, attached to the host's Windows parent window, using native controls. Wave Link verification of the replacement editor and physical echo measurements are separate acceptance steps.
+A Wave Link 3 field test of 0.1.1 confirmed that the custom editor opened and listed Personal Mix as a capture endpoint. The host showed active microphone and playback meters while BunCancel stayed at “Dry - acquiring alignment”. The meters are upstream observations. That display covered several different conditions. That observation establishes endpoint selection and the old status branch; it does not establish the waveform level, timing or amount of leakage on that system.
 
-Select the endpoint carrying the playback you want to cancel, then enable AEC. Choosing **None** or switching on **Bypass** sends the dry microphone through. The editor displays the processor's status, including reference acquisition, device or format errors, alignment search and active cancellation. An alignment indication describes the filter state. It does not measure acoustic attenuation.
+### Local Wave Link check
+
+1. Put BunCancel on the microphone chain and select the endpoint carrying the playback you hear. Keep microphone monitoring out of that mix.
+2. Enable AEC and leave bypass off. With a valid reference stream, **Ready** is the expected result even in a quiet room. The mic continues through and the engine monitors automatically. There is no calibration step.
+3. Read the **BunCancel** mic and reference RMS/peak values during normal speech and playback. The two host mixer meters can be active even if the selected endpoint supplies different PCM. A silent plugin reference with audible playback points to the reference route. A silent plugin microphone during speech points to the plugin input route.
+4. If reference interruptions accumulate, check device availability and the host and endpoint sample rates shown in the editor. A steady **Ready** with both meters moving can simply mean the playback produces no detectable mic leakage. **Cancelling** indicates recent aligned subtraction with measured reduction. The estimate is a live diagnostic, not a ground-truth ERLE score.
 
 The endpoint picker contains explicit render-loopback and capture endpoints
 exposed by Windows, ordered by stable endpoint ID. An endpoint name alone does
@@ -44,21 +49,23 @@ controller and processor. This prevents topology changes between initialization
 from mapping an index to the wrong reference. Fully unload the module from the
 host (or restart the host) after topology changes to refresh the endpoint picker. Closing and reopening just the editor retains the same device list and selection.
 
-Device start, switch and shutdown run on a control worker. Audio processing
-consumes fixed-size timestamped packets without allocating, locking or calling
-Windows audio APIs. Captured generation changes, device-position discontinuities,
-queue loss, packets more than 100 ms old, underrun, no selection, bypass and disconnected capture invalidate
-alignment and select the dry path. The implementation retries capture only after
-an explicit disable/enable or endpoint change; it does not repeatedly reconnect an
-unavailable device. State loading is bounded to a 4096-byte endpoint identifier.
+Device start, switch and shutdown run off the audio thread. The callback reads timestamped capture packets from a bounded queue. A discontinuity invalidates the time mapping and adaptive state, so the mic passes dry while the reference timeline refills. A rate mismatch leaves the microphone dry.
 
-Processing declares zero additional output samples of latency: the microphone is
-not delayed. Reference buffering affects the relative alignment search, not the
-host's output latency. Timestamped capture is retained, but host/capture clock
-mapping and drift correction are not implemented; equal nominal sample rates do
-not establish synchronized clocks. Different sample rates fail dry. Delay search
-can only recover within the DSP engine's documented range, so this integration
-must not be presented as proven cancellation on arbitrary hosts or wireless paths.
+The callback estimates the microphone block start from its end time, block length and sample position when available. It looks up reference samples on a two-second timeline using WASAPI QPC timestamps and device positions. Interpolation tracks small clock-rate differences. A fixed 20 ms reference holdback absorbs packet scheduling jitter. The displayed packet offset is the mic block start minus the start of the latest capture packet. Candidate lag includes the holdback and can differ from packet offset. A weak peak is labelled unconfirmed.
+
+The DSP can subtract at effective lags of two samples through 333 ms after holdback. It also checks excluded lags down to −40 ms and up to 500 ms for diagnostics only. A reference arriving too late for the current mic block, a very short path inside the holdback or a long wireless delay can still leave correlated leakage dry. The microphone has zero algorithmic lookahead. Reference timing uses WASAPI packet timestamps and an estimate of the host block time. Host buffering and device latency can contribute to the observed lag. A timestamp on a callback is not a measurement of when sound reached the microphone.
+
+## Measured timing regressions
+
+Run `ctest --test-dir build-vst3 -C Release -V -R "^reference-(timeline|pipeline)$"` for the deterministic clock and signal scenarios. The pipeline test feeds identical generated reference and mic samples to a reproduction of the former FIFO policy and to the production timeline, host clock and AEC. At 48 kHz it scores the final two seconds of each six-second signal. The paths in this table have a strong direct component and one short reflection.
+
+| Synthetic far-only case | Former FIFO ERLE | Timestamped ERLE |
+| --- | ---: | ---: |
+| 80 ms startup backlog, 40 ms echo path | 0.00 dB | 41.05 dB |
+| −1000 ppm capture clock, uneven packet delivery | 0.00 dB | 29.52 dB |
+| Ordinary 480-frame capture and 256-frame mic blocks | 41.17 dB | 41.04 dB |
+
+With speech-like playback, settled far-only ERLE was 40.70 dB. During simultaneous independent speech, the projection of the output onto the clean near-end stem was 0.997 and residual error energy was 2.24% of near-end energy. Independent speech without bleed and speech over a silent reference were bit-exact dry. A silent mic produced exact zero, including after training. With ±1 ms callback scheduling jitter the far-only score fell to 13.12 dB. After a simulated 250 ms reference outage, evidence of reduction returned in 889 ms. Physical headsets, room impulse responses and host buffering can produce different results.
 
 ## Pinned dependency and licenses
 
@@ -91,5 +98,4 @@ SDK validation covers host-interface conformance, not acoustic quality. Before
 claiming Gate C/D, collect real Windows load/unload and state-reload results,
 64–2048-sample blocks, bypass transitions, callback allocation/deadline evidence,
 actual latency, hot device changes/disconnect, format mismatch, drift, reference
-contamination, and physical Wave Link 3 plus ordinary-device recordings. No such
-hardware results are supplied by this integration.
+contamination, and physical Wave Link 3 plus ordinary-device recordings. The reported editor and endpoint observations do not include physical attenuation or voice-retention measurements.

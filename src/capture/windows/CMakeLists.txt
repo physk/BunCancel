@@ -1,5 +1,5 @@
-add_library(buncancel-capture STATIC reference_capture.cpp)
-target_include_directories(buncancel-capture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(buncancel-capture STATIC reference_capture.cpp ../reference_timeline.cpp)
+target_include_directories(buncancel-capture PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_features(buncancel-capture PUBLIC cxx_std_20)
 set_target_properties(buncancel-capture PROPERTIES POSITION_INDEPENDENT_CODE ON)
 find_package(Threads REQUIRED)

@@ -16,6 +16,8 @@ Requirements are marked MUST, SHOULD, or LATER. They are design requirements unl
 - Estimate relative delay and track slow timing drift between playback reference and microphone capture.
 - Model a finite acoustic path (gain, spectral coloration and reflections), including nonstationary paths.
 - Implement original adaptive echo estimation, near-end/double-talk safeguards and bounded residual echo suppression.
+- A valid reference stream makes an enabled processor ready to monitor. Playback silence, a muted mic and independent near-end speech are normal operating conditions. AEC must start and pass microphone samples without acoustic calibration or audible leakage.
+- Show current subtraction activity separately from capture readiness. Only indicate cancellation when aligned subtraction is reducing measured signal energy. Distinguish measured silence from unavailable samples.
 - Preserve near-end speech; never optimize only for output silence.
 - On no-reference, silence, crash, or unusable alignment, pass through the mic reliably and display a degraded status.
 - Protect against extreme reference level, clipping and nonlinear loudspeaker/headphone distortion. Document the limits honestly.

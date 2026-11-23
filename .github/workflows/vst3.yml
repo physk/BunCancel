@@ -12,7 +12,9 @@ jobs:
       - name: Configure pinned SDK and native plugin
         run: cmake -S . -B build-vst3 -A x64 -DBUNCANCEL_BUILD_VST3=ON
       - name: Build plugin, editor smoke host and SDK validator
-        run: cmake --build build-vst3 --config Release --target buncancel-editor-smoke validator --parallel
+        run: cmake --build build-vst3 --config Release --target buncancel-editor-smoke buncancel-timeline-tests buncancel-pipeline-tests validator --parallel
+      - name: Verify reference timing and readiness before packaging
+        run: ctest --test-dir build-vst3 -C Release -R "^reference-(timeline|pipeline)$" --no-tests=error --verbose
       - name: Open, operate and reopen the packaged editor in a Windows host window
         run: ctest --test-dir build-vst3 -C Release -R "^vst3-editor$" --no-tests=error --output-on-failure
       - name: Locate and validate the packaged module

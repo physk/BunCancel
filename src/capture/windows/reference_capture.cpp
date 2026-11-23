@@ -164,6 +164,8 @@ struct ReferenceCapture::Impl {
   std::atomic<CaptureStatus> status{CaptureStatus::stopped};
   std::atomic<std::uint64_t> generation{};
   std::atomic<std::uint64_t> dropped{};
+  std::atomic<std::uint64_t> discontinuities{};
+  std::atomic<std::uint32_t> actual_rate{};
   std::atomic<bool> stop_requested{};
   std::thread worker;
 #ifdef _WIN32
@@ -207,6 +209,7 @@ struct ReferenceCapture::Impl {
       fail(CaptureStatus::unsupported_format);
       return;
     }
+    actual_rate.store(format.sample_rate, std::memory_order_release);
     // Resampling/drift correction is not implemented here. Refuse an unsafe
     // timebase instead of treating differing-rate samples as aligned evidence.
     if (format.sample_rate != config.sample_rate) {
@@ -229,6 +232,7 @@ struct ReferenceCapture::Impl {
     ClientStop client_stop(client.get());
     status.store(CaptureStatus::running, std::memory_order_release);
     bool discontinuity = true;
+    bool first_buffer = true;
     const HANDLE events[]{stop_event->get(), data_event.get()};
     while (!stop_requested.load(std::memory_order_acquire)) {
       const auto wait = WaitForMultipleObjects(2, events, FALSE, 250);
@@ -256,6 +260,12 @@ struct ReferenceCapture::Impl {
           fail(CaptureStatus::device_error);
           return;
         }
+        if ((packet_flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) ||
+            (!first_buffer &&
+             (packet_flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY))) {
+          discontinuities.fetch_add(1, std::memory_order_relaxed);
+        }
+        first_buffer = false;
         discontinuity = discontinuity ||
                         (packet_flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY);
         const bool timestamp_valid =
@@ -366,6 +376,7 @@ std::vector<Endpoint> ReferenceCapture::enumerate_endpoints() {
 
 bool ReferenceCapture::start(const CaptureConfig &config) {
   stop();
+  impl_->actual_rate.store(0, std::memory_order_release);
   if (config.endpoint_id.empty() || config.sample_rate < 8000 ||
       config.sample_rate > 192000) {
     impl_->status.store(CaptureStatus::device_error, std::memory_order_release);
@@ -442,6 +453,14 @@ CaptureStatus ReferenceCapture::status() const noexcept {
 
 std::uint64_t ReferenceCapture::dropped_packets() const noexcept {
   return impl_->dropped.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ReferenceCapture::discontinuities() const noexcept {
+  return impl_->discontinuities.load(std::memory_order_relaxed);
+}
+
+std::uint32_t ReferenceCapture::actual_sample_rate() const noexcept {
+  return impl_->actual_rate.load(std::memory_order_acquire);
 }
 
 } // namespace buncancel::capture
