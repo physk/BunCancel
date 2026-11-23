@@ -1,8 +1,10 @@
 #include "aec.hpp"
+#include "editor.hpp"
 #include "reference_capture.hpp"
 
 #include "base/source/fstreamer.h"
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/vst/ivstmessage.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 #include "public.sdk/source/main/pluginfactory.h"
 #include "public.sdk/source/vst/utility/stringconvert.h"
@@ -14,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -37,6 +40,9 @@ constexpr ParamID enabledId = 0;
 constexpr ParamID endpointId = 1;
 constexpr ParamID bypassId = 2;
 constexpr ParamID statusId = 3;
+constexpr const char *statusRequest = "BunCancel.Status.Request";
+constexpr const char *statusReply = "BunCancel.Status.Reply";
+constexpr const char *statusAttribute = "status";
 
 enum class ProcessingStatus {
   dry,
@@ -47,6 +53,8 @@ enum class ProcessingStatus {
   acquiringAlignment,
   cancelling,
   silentMicrophone,
+  noReference,
+  unavailable,
   count
 };
 
@@ -125,13 +133,12 @@ public:
                                 endpointId, nullptr, ParameterInfo::kIsList);
     picker->appendString(STR16("None - dry microphone"));
     for (const auto &device : devices_) {
-      String128 name{};
-      const auto label =
-          device.name + (device.kind == capture::EndpointKind::render_loopback
-                             ? " [render loopback]"
-                             : " [capture]");
-      StringConvert::convert(label, name);
-      picker->appendString(name);
+      const auto label = (device.kind == capture::EndpointKind::render_loopback
+                              ? "[Render loopback] "
+                              : "[Capture] ") +
+                         device.name;
+      const auto name = StringConvert::convert(label);
+      picker->appendString(toTChar(name));
     }
     parameters.addParameter(picker);
     auto *status = new StringListParameter(
@@ -145,8 +152,57 @@ public:
     status->appendString(STR16("Dry - acquiring alignment"));
     status->appendString(STR16("Cancelling - alignment acquired"));
     status->appendString(STR16("Dry - silent microphone"));
+    status->appendString(STR16("Dry - no reference selected"));
+    status->appendString(STR16("Status unavailable - waiting for processor"));
     parameters.addParameter(status);
+    setParamNormalized(statusId, 1.0);
     return kResultOk;
+  }
+
+  IPlugView *PLUGIN_API createView(FIDString name) override {
+    if (name && std::strcmp(name, ViewType::kEditor) == 0)
+      return createEditor(this);
+    return nullptr;
+  }
+
+  void refreshStatus() {
+    // The native editor calls this only on its UI timer. Hosts need not forward
+    // processor output parameters for the custom editor to observe live status.
+    // A missed reply expires the previous observation, including proxy
+    // failures.
+    const auto now = std::chrono::steady_clock::now();
+    if (!getPeer() || !haveStatus_ ||
+        now - lastStatus_ > std::chrono::seconds(1))
+      setParamNormalized(statusId, 1.0);
+    if (getPeer())
+      sendMessageID(statusRequest);
+  }
+
+  tresult PLUGIN_API notify(IMessage *message) override {
+    if (message && message->getMessageID() &&
+        std::strcmp(message->getMessageID(), statusReply) == 0) {
+      if (!getPeer())
+        return kResultFalse;
+      int64 status = 0;
+      if (!message->getAttributes() ||
+          message->getAttributes()->getInt(statusAttribute, status) !=
+              kResultOk ||
+          status < 0 || status >= static_cast<int>(ProcessingStatus::count))
+        return kResultFalse;
+      setParamNormalized(statusId,
+                         static_cast<double>(status) /
+                             (static_cast<int>(ProcessingStatus::count) - 1));
+      haveStatus_ = true;
+      lastStatus_ = std::chrono::steady_clock::now();
+      return kResultOk;
+    }
+    return EditController::notify(message);
+  }
+
+  tresult PLUGIN_API disconnect(IConnectionPoint *other) override {
+    haveStatus_ = false;
+    setParamNormalized(statusId, 1.0);
+    return EditController::disconnect(other);
   }
 
   tresult PLUGIN_API setComponentState(IBStream *state) override {
@@ -164,8 +220,15 @@ public:
   }
 
 private:
+  bool haveStatus_ = false;
+  std::chrono::steady_clock::time_point lastStatus_{};
   std::vector<capture::Endpoint> devices_;
 };
+
+void refreshStatus(EditController *controller) {
+  if (controller)
+    static_cast<Controller *>(controller)->refreshStatus();
+}
 
 class Processor final : public AudioEffect {
 public:
@@ -229,6 +292,7 @@ public:
         return kResultFalse;
       engine_->reset();
       lastReportedStatus_ = -1;
+      latestStatus_.store(ProcessingStatus::awaitingReference);
       packetOffset_ = packet_.frame_count = 0;
       stopWorker();
       running_.store(true);
@@ -242,6 +306,36 @@ public:
       stopWorker();
     }
     return AudioEffect::setActive(active);
+  }
+
+  tresult PLUGIN_API notify(IMessage *message) override {
+    if (message && message->getMessageID() &&
+        std::strcmp(message->getMessageID(), statusRequest) == 0) {
+      // IConnectionPoint::notify is a UI-thread API. Only atomic observations
+      // cross from process(); message allocation and host callbacks stay here.
+      auto status = latestStatus_.load();
+      if (!enabled_.load() || bypass_.load())
+        status = ProcessingStatus::dry;
+      else if (selected_.load() == 0)
+        status = ProcessingStatus::noReference;
+      else if (!running_.load() || !processing_.load() ||
+               status == ProcessingStatus::dry)
+        status = ProcessingStatus::awaitingReference;
+      auto reply = owned(allocateMessage());
+      if (!reply || !reply->getAttributes())
+        return kResultFalse;
+      reply->setMessageID(statusReply);
+      if (reply->getAttributes()->setInt(
+              statusAttribute, static_cast<int64>(status)) != kResultOk)
+        return kResultFalse;
+      return sendMessage(reply);
+    }
+    return AudioEffect::notify(message);
+  }
+
+  tresult PLUGIN_API setProcessing(TBool state) override {
+    processing_.store(state != 0);
+    return kResultOk;
   }
 
   uint32 PLUGIN_API getLatencySamples() override { return 0; }
@@ -383,6 +477,8 @@ private:
     auto status = ProcessingStatus::awaitingReference;
     if (!enabled_.load() || bypass_.load()) {
       status = ProcessingStatus::dry;
+    } else if (selected_.load() == 0) {
+      status = ProcessingStatus::noReference;
     } else {
       switch (capture_.status()) {
       case capture::CaptureStatus::rate_mismatch:
@@ -407,6 +503,7 @@ private:
         break;
       }
     }
+    latestStatus_.store(status);
     const auto value = static_cast<int>(status);
     if (!data.outputParameterChanges || value == lastReportedStatus_)
       return;
@@ -477,6 +574,9 @@ private:
   bool havePosition_ = false;
   bool silent_ = false;
   int lastReportedStatus_ = -1;
+  static_assert(std::atomic<ProcessingStatus>::is_always_lock_free);
+  std::atomic<ProcessingStatus> latestStatus_{ProcessingStatus::dry};
+  std::atomic<bool> processing_{false};
   std::atomic<uint64_t> clock100ns_{0};
   uint64_t audioConnection_ = 0;
   std::atomic<uint64_t> captureEpoch_{0};
@@ -495,10 +595,10 @@ using namespace Steinberg::Vst;
 BEGIN_FACTORY_DEF("BunCancel", "", "")
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::processorId),
            PClassInfo::kManyInstances, kVstAudioEffectClass,
-           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.0",
+           "BunCancel Experimental", 0, "Fx|Restoration", "0.1.1",
            kVstVersionString, buncancel::plugin::Processor::create)
 DEF_CLASS2(INLINE_UID_FROM_FUID(buncancel::plugin::controllerId),
            PClassInfo::kManyInstances, kVstComponentControllerClass,
-           "BunCancel Controller", 0, "", "0.1.0", kVstVersionString,
+           "BunCancel Controller", 0, "", "0.1.1", kVstVersionString,
            buncancel::plugin::Controller::create)
 END_FACTORY

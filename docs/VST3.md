@@ -4,31 +4,30 @@ The optional plugin builds an actual native x64 VST3 module around the portable
 AEC engine and asynchronous WASAPI reference capture. It is an experimental
 integration; host/device and physical audio acceptance gates remain open.
 
-Build with Visual Studio 2022, a Windows SDK, Git and CMake 3.25 or newer:
+## Install or upgrade the Windows bundle
+
+1. Use the editor-enabled build (plugin version 0.1.1). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
+2. Close Wave Link and any other hosts using the plugin. Save the current host settings. In the VST3 search directory, the existing `BunCancel.vst3` may be a single file or a folder with that same name. Move the **entire existing item** to a backup directory outside the scan paths. Keep the backup until the upgrade works.
+3. Copy the **outer folder** from staging into the search directory. A typical resulting path is `C:\Program Files\Common Files\VST3\BunCancel.vst3\Contents\x86_64-win\BunCancel.vst3`. Leave the resources and inner binary together. Installing a second loose copy of the inner binary can make the host resolve the wrong plugin.
+4. Reopen the host, rescan if available, and open BunCancel's editor on the microphone chain. The editor should show the playback-reference picker, enable and bypass controls, and processing status. To roll back, close the host, move the new bundle out of the scan path and restore the backed-up item under its original name.
+
+## Build and test
+
+Use Visual Studio with the Windows x64 C++ toolchain, a Windows SDK, Git and CMake 3.25 or newer.
 
 ```sh
 cmake -S . -B build-vst3 -A x64 -DBUNCANCEL_BUILD_VST3=ON
-cmake --build build-vst3 --config Release --target BunCancel validator --parallel
+cmake --build build-vst3 --config Release --target buncancel-editor-smoke validator --parallel
+ctest --test-dir build-vst3 -C Release -R "^vst3-editor$" --no-tests=error --output-on-failure
 ```
 
-Run the built `validator.exe` with the path to the complete `BunCancel.vst3` bundle.
-The `Experimental Windows VST3` GitHub Actions workflow runs this check and
-uploads an unsigned experimental artifact. A workflow definition is not evidence
-that a Windows build or validator run has passed. Install the complete
-`BunCancel.vst3` directory into the host's VST3 search location; building does not
-install it or modify any audio routes.
+The Windows workflow also runs the SDK's `validator.exe` against the full bundle and uploads the unsigned ZIP after the checks pass.
 
 ## Reference selection and lifecycle
 
-Use the host's generic parameter editor. Select **Playback reference (no mic
-monitoring)**, then turn on **Enable experimental AEC**. The default is dry mic.
-The read-only **Reference / AEC status** parameter reports dry/off or bypassed,
-awaiting reference, sample-rate mismatch, unsupported format, unavailable device,
-acquiring alignment, cancelling, or silent microphone. It is published through
-standard VST3 output parameter changes while the host invokes processing; hosts
-that do not display those updates may leave the generic editor's status stale.
-“Cancelling” describes the engine's current alignment state, not verified echo
-attenuation or hardware compatibility.
+A physical Wave Link 3 test confirmed that the previous bundle loaded but opened a blank editor window. The replacement controller provides its own VST3 editor, attached to the host's Windows parent window, using native controls. Wave Link verification of the replacement editor and physical echo measurements are separate acceptance steps.
+
+Select the endpoint carrying the playback you want to cancel, then enable AEC. Choosing **None** or switching on **Bypass** sends the dry microphone through. The editor displays the processor's status, including reference acquisition, device or format errors, alignment search and active cancellation. An alignment indication describes the filter state. It does not measure acoustic attenuation.
 
 The endpoint picker contains explicit render-loopback and capture endpoints
 exposed by Windows, ordered by stable endpoint ID. An endpoint name alone does
@@ -43,7 +42,7 @@ bypass survive component-state reload; a missing saved endpoint resolves to
 **None**, never an automatically substituted device. Enumeration creates one immutable module-wide snapshot shared by every
 controller and processor. This prevents topology changes between initialization
 from mapping an index to the wrong reference. Fully unload the module from the
-host (or restart the host) after topology changes to refresh the generic picker.
+host (or restart the host) after topology changes to refresh the endpoint picker. Closing and reopening just the editor retains the same device list and selection.
 
 Device start, switch and shutdown run on a control worker. Audio processing
 consumes fixed-size timestamped packets without allocating, locking or calling

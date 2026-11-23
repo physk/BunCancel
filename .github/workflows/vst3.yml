@@ -11,8 +11,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Configure pinned SDK and native plugin
         run: cmake -S . -B build-vst3 -A x64 -DBUNCANCEL_BUILD_VST3=ON
-      - name: Build plugin and SDK validator
-        run: cmake --build build-vst3 --config Release --target BunCancel validator --parallel
+      - name: Build plugin, editor smoke host and SDK validator
+        run: cmake --build build-vst3 --config Release --target buncancel-editor-smoke validator --parallel
+      - name: Open, operate and reopen the packaged editor in a Windows host window
+        run: ctest --test-dir build-vst3 -C Release -R "^vst3-editor$" --no-tests=error --output-on-failure
       - name: Locate and validate the packaged module
         shell: pwsh
         run: |
@@ -21,6 +23,11 @@ jobs:
           if (!$module -or !$validator) { throw 'Plugin bundle or validator missing' }
           & $validator.FullName $module.FullName
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binary = Join-Path $module.FullName 'Contents/x86_64-win/BunCancel.vst3'
+          $info = Join-Path $module.FullName 'Contents/Resources/moduleinfo.json'
+          if (!(Test-Path $binary -PathType Leaf) -or !(Test-Path $info -PathType Leaf)) {
+            throw 'Incomplete Windows VST3 bundle'
+          }
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item $module.FullName package -Recurse
       - uses: actions/upload-artifact@v4

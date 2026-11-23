@@ -11,10 +11,11 @@ FetchContent_Declare(vst3sdk
     GIT_SUBMODULES_RECURSE OFF)
 FetchContent_MakeAvailable(vst3sdk)
 smtg_enable_vst3_sdk()
-set(PROJECT_VERSION 0.1.0)
-smtg_add_vst3plugin(BunCancel plugin.cpp)
+set(PROJECT_VERSION ${BunCancel_VERSION})
+smtg_add_vst3plugin(BunCancel plugin.cpp editor.cpp)
 target_compile_features(BunCancel PRIVATE cxx_std_20)
-target_link_libraries(BunCancel PRIVATE sdk buncancel-dsp buncancel-capture)
+target_compile_definitions(BunCancel PRIVATE UNICODE _UNICODE)
+target_link_libraries(BunCancel PRIVATE sdk buncancel-dsp buncancel-capture user32 gdi32)
 target_include_directories(BunCancel PRIVATE "${vst3sdk_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/src/capture/windows")
 # Redistribute the exact SDK notices with the binary bundle.
 foreach(component IN ITEMS base cmake pluginterfaces public.sdk)
@@ -27,3 +28,14 @@ endforeach()
 add_custom_command(TARGET BunCancel POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${vst3sdk_SOURCE_DIR}/LICENSE.txt"
         "$<TARGET_FILE_DIR:BunCancel>/../Resources/licenses/VST3-SDK-LICENSE.txt")
+
+if(BUILD_TESTING)
+    add_executable(buncancel-editor-smoke
+        ${PROJECT_SOURCE_DIR}/tests/plugin/editor_smoke.cpp
+        ${vst3sdk_SOURCE_DIR}/public.sdk/source/common/memorystream.cpp)
+    target_include_directories(buncancel-editor-smoke PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR} ${vst3sdk_SOURCE_DIR})
+    target_link_libraries(buncancel-editor-smoke PRIVATE sdk_hosting user32 gdi32 ole32)
+    add_dependencies(buncancel-editor-smoke BunCancel)
+    add_test(NAME vst3-editor COMMAND buncancel-editor-smoke $<TARGET_FILE:BunCancel>)
+endif()
