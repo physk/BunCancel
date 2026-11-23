@@ -1,0 +1,30 @@
+# Build and runtime
+build/
+out/
+dist/
+CMakeFiles/
+CMakeCache.txt
+.vs/
+.idea/
+.vscode/
+*.sln
+*.vcxproj*
+*.user
+*.ilk
+*.pdb
+*.obj
+*.o
+*.dll
+*.exe
+*.vst3
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+.DS_Store
+
+# Generated fixtures/benchmark outputs, not source fixtures
+fixtures-generated/
+reports/
+*.profraw
+*.profdata
