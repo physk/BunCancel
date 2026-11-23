@@ -15,7 +15,10 @@
 #include <initguid.h>
 
 #include <audioclient.h>
+#include <propkeydef.h>
+
 #include <functiondiscoverykeys_devpkey.h>
+#include <ks.h>
 #include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>

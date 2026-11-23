@@ -22,6 +22,14 @@ install it or modify any audio routes.
 
 Use the host's generic parameter editor. Select **Playback reference (no mic
 monitoring)**, then turn on **Enable experimental AEC**. The default is dry mic.
+The read-only **Reference / AEC status** parameter reports dry/off or bypassed,
+awaiting reference, sample-rate mismatch, unsupported format, unavailable device,
+acquiring alignment, cancelling, or silent microphone. It is published through
+standard VST3 output parameter changes while the host invokes processing; hosts
+that do not display those updates may leave the generic editor's status stale.
+“Cancelling” describes the engine's current alignment state, not verified echo
+attenuation or hardware compatibility.
+
 The endpoint picker contains explicit render-loopback and capture endpoints
 exposed by Windows, ordered by stable endpoint ID. An endpoint name alone does
 not prove that it is a suitable far-end reference. Ensure microphone monitoring

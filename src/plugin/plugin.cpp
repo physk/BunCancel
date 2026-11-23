@@ -36,6 +36,19 @@ const FUID controllerId(0x79320171, 0x14FC4B9B, 0xA9C3421A, 0x980C6D50);
 constexpr ParamID enabledId = 0;
 constexpr ParamID endpointId = 1;
 constexpr ParamID bypassId = 2;
+constexpr ParamID statusId = 3;
+
+enum class ProcessingStatus {
+  dry,
+  awaitingReference,
+  rateMismatch,
+  unsupportedFormat,
+  deviceError,
+  acquiringAlignment,
+  cancelling,
+  silentMicrophone,
+  count
+};
 
 std::vector<capture::Endpoint> endpoints() {
   // One immutable module snapshot guarantees identical controller/processor
@@ -107,8 +120,9 @@ public:
     parameters.addParameter(
         STR16("Bypass"), nullptr, 1, 0,
         ParameterInfo::kCanAutomate | ParameterInfo::kIsBypass, bypassId);
-    auto *picker = new StringListParameter(
-        STR16("Playback reference (no mic monitoring)"), endpointId);
+    auto *picker =
+        new StringListParameter(STR16("Playback reference (no mic monitoring)"),
+                                endpointId, nullptr, ParameterInfo::kIsList);
     picker->appendString(STR16("None - dry microphone"));
     for (const auto &device : devices_) {
       String128 name{};
@@ -120,6 +134,18 @@ public:
       picker->appendString(name);
     }
     parameters.addParameter(picker);
+    auto *status = new StringListParameter(
+        STR16("Reference / AEC status"), statusId, nullptr,
+        ParameterInfo::kIsList | ParameterInfo::kIsReadOnly);
+    status->appendString(STR16("Dry - AEC off or bypassed"));
+    status->appendString(STR16("Dry - awaiting playback reference"));
+    status->appendString(STR16("Dry - reference sample-rate mismatch"));
+    status->appendString(STR16("Dry - unsupported reference format"));
+    status->appendString(STR16("Dry - reference device unavailable"));
+    status->appendString(STR16("Dry - acquiring alignment"));
+    status->appendString(STR16("Cancelling - alignment acquired"));
+    status->appendString(STR16("Dry - silent microphone"));
+    parameters.addParameter(status);
     return kResultOk;
   }
 
@@ -202,6 +228,7 @@ public:
       if (!engine_)
         return kResultFalse;
       engine_->reset();
+      lastReportedStatus_ = -1;
       packetOffset_ = packet_.frame_count = 0;
       stopWorker();
       running_.store(true);
@@ -267,8 +294,10 @@ public:
         }
       }
     }
-    if (data.numSamples == 0 || data.numInputs == 0 || data.numOutputs == 0)
+    if (data.numSamples == 0 || data.numInputs == 0 || data.numOutputs == 0) {
+      reportStatus(data, false);
       return kResultOk;
+    }
     if (data.symbolicSampleSize != kSample32 || data.numInputs < 1 ||
         data.numOutputs < 1 || data.inputs[0].numChannels < 1 ||
         data.outputs[0].numChannels < 1 || !data.inputs[0].channelBuffers32 ||
@@ -288,6 +317,7 @@ public:
       for (int i = 0; i < 64 && capture_.pop(discarded); ++i) {
       }
       data.outputs[0].silenceFlags = 1;
+      reportStatus(data, false, true);
       return kResultOk;
     }
     silent_ = false;
@@ -343,10 +373,57 @@ public:
       std::copy_n(mic, data.numSamples, out);
     }
     data.outputs[0].silenceFlags = data.inputs[0].silenceFlags;
+    reportStatus(data, complete);
     return kResultOk;
   }
 
 private:
+  void reportStatus(ProcessData &data, bool processed,
+                    bool silent = false) noexcept {
+    auto status = ProcessingStatus::awaitingReference;
+    if (!enabled_.load() || bypass_.load()) {
+      status = ProcessingStatus::dry;
+    } else {
+      switch (capture_.status()) {
+      case capture::CaptureStatus::rate_mismatch:
+        status = ProcessingStatus::rateMismatch;
+        break;
+      case capture::CaptureStatus::unsupported_format:
+        status = ProcessingStatus::unsupportedFormat;
+        break;
+      case capture::CaptureStatus::device_error:
+        status = ProcessingStatus::deviceError;
+        break;
+      case capture::CaptureStatus::running:
+        if (selected_.load() == connected_.load() && connected_.load() > 0) {
+          status = silent      ? ProcessingStatus::silentMicrophone
+                   : processed ? (engine_ && engine_->aligned()
+                                      ? ProcessingStatus::cancelling
+                                      : ProcessingStatus::acquiringAlignment)
+                               : ProcessingStatus::awaitingReference;
+        }
+        break;
+      default:
+        break;
+      }
+    }
+    const auto value = static_cast<int>(status);
+    if (!data.outputParameterChanges || value == lastReportedStatus_)
+      return;
+    // The host owns the output-change storage supplied for this callback.
+    // No SDK parameter objects or strings are created on the audio thread.
+    int32 queueIndex = 0;
+    auto *queue =
+        data.outputParameterChanges->addParameterData(statusId, queueIndex);
+    if (!queue)
+      return;
+    int32 pointIndex = 0;
+    const auto normalized = static_cast<double>(value) /
+                            (static_cast<int>(ProcessingStatus::count) - 1);
+    if (queue->addPoint(0, normalized, pointIndex) == kResultTrue)
+      lastReportedStatus_ = value;
+  }
+
   void stopWorker() noexcept {
     running_.store(false);
     if (worker_.joinable())
@@ -399,6 +476,7 @@ private:
   uint64_t audioGeneration_ = 0, expectedPosition_ = 0;
   bool havePosition_ = false;
   bool silent_ = false;
+  int lastReportedStatus_ = -1;
   std::atomic<uint64_t> clock100ns_{0};
   uint64_t audioConnection_ = 0;
   std::atomic<uint64_t> captureEpoch_{0};
