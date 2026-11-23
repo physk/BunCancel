@@ -1,6 +1,7 @@
 #include "reference_capture.hpp"
 
 #include "packet_queue.hpp"
+#include "reference_fragment.hpp"
 #include "sample_format.hpp"
 
 #include <atomic>
@@ -271,33 +272,14 @@ struct ReferenceCapture::Impl {
         const bool timestamp_valid =
             !(packet_flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR);
         const bool silent = (packet_flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0;
-        if (!timestamp_valid || (!silent && !data)) {
+        if (!silent && !data) {
           discontinuity = true;
         } else {
           for (UINT32 offset = 0; offset < frames;) {
-            ReferencePacket packet;
-            packet.frame_count =
-                std::min(ReferencePacket::max_frames, frames - offset);
-            packet.channel_count = format.channels;
-            packet.sample_rate = format.sample_rate;
-            packet.device_position = device_position + offset;
-            packet.qpc_position_100ns =
-                qpc_position +
-                static_cast<UINT64>(offset) * 10000000ULL / format.sample_rate;
-            packet.generation = stream_generation;
-            packet.discontinuity = discontinuity;
-            if (!silent) {
-              const auto sample_bytes = format.bits / 8;
-              const auto sample_offset = offset * format.channels;
-              const auto sample_count = packet.frame_count * format.channels;
-              for (UINT32 sample = 0; sample < sample_count; ++sample) {
-                packet.samples[sample] = detail::decode_sample(
-                    data + (sample_offset + sample) * sample_bytes, format);
-              }
-            }
-            if (queue.push(packet)) {
-              discontinuity = false;
-            } else {
+            const auto packet = detail::reference_fragment(
+                data, format, frames, offset, device_position, qpc_position,
+                stream_generation, silent, timestamp_valid, discontinuity);
+            if (!queue.push(packet)) {
               dropped.fetch_add(1, std::memory_order_relaxed);
               discontinuity = true;
             }

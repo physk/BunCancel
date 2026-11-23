@@ -25,7 +25,7 @@ The Windows workflow also runs the SDK's `validator.exe` against the full bundle
 
 ## Reference selection and lifecycle
 
-A Wave Link 3 field test of 0.1.1 confirmed that the custom editor opened and listed Personal Mix as a capture endpoint. The host showed active microphone and playback meters while BunCancel stayed at “Dry - acquiring alignment”. The meters are upstream observations. That display covered several different conditions. That observation establishes endpoint selection and the old status branch; it does not establish the waveform level, timing or amount of leakage on that system.
+A Wave Link 3 field test of 0.1.1 confirmed that the custom editor opened and listed Personal Mix as a capture endpoint. The host showed active microphone and playback meters while BunCancel stayed at “Dry - acquiring alignment”. That editor status established that reference samples reached the DSP. The host meters could not show the PCM levels inside BunCancel, their relative timing or how much playback reached the mic.
 
 ### Local Wave Link check
 
@@ -49,7 +49,7 @@ controller and processor. This prevents topology changes between initialization
 from mapping an index to the wrong reference. Fully unload the module from the
 host (or restart the host) after topology changes to refresh the endpoint picker. Closing and reopening just the editor retains the same device list and selection.
 
-Device start, switch and shutdown run off the audio thread. The callback reads timestamped capture packets from a bounded queue. A discontinuity invalidates the time mapping and adaptive state, so the mic passes dry while the reference timeline refills. A rate mismatch leaves the microphone dry.
+Device start, switch and shutdown run off the audio thread. The callback reads timestamped capture packets from a bounded queue. The reference meter measures incoming PCM before stereo downmix and timeline validation. If WASAPI flags an unreliable timestamp, its PCM can still move the meter while the mic stays dry. The gap counter records the timing error. A discontinuity invalidates the time mapping and adaptive state, so the mic passes dry while the reference timeline refills. A rate mismatch leaves the microphone dry.
 
 The callback estimates the microphone block start from its end time, block length and sample position when available. It looks up reference samples on a two-second timeline using WASAPI QPC timestamps and device positions. Interpolation tracks small clock-rate differences. A fixed 20 ms reference holdback absorbs packet scheduling jitter. The displayed packet offset is the mic block start minus the start of the latest capture packet. Candidate lag includes the holdback and can differ from packet offset. A weak peak is labelled unconfirmed.
 
@@ -65,7 +65,7 @@ Run `ctest --test-dir build-vst3 -C Release -V -R "^reference-(timeline|pipeline
 | −1000 ppm capture clock, uneven packet delivery | 0.00 dB | 29.52 dB |
 | Ordinary 480-frame capture and 256-frame mic blocks | 41.17 dB | 41.04 dB |
 
-With speech-like playback, settled far-only ERLE was 40.70 dB. During simultaneous independent speech, the projection of the output onto the clean near-end stem was 0.997 and residual error energy was 2.24% of near-end energy. Independent speech without bleed and speech over a silent reference were bit-exact dry. A silent mic produced exact zero, including after training. With ±1 ms callback scheduling jitter the far-only score fell to 13.12 dB. After a simulated 250 ms reference outage, alignment returned in 889 ms and the processor reported measured cancellation after 931 ms. Physical headsets, room impulse responses and host buffering can produce different results.
+With speech-like playback, settled far-only ERLE was 40.70 dB. During simultaneous independent speech, the projection of the output onto the clean near-end stem was 0.997 and residual error energy was 2.24% of near-end energy. Independent speech without bleed and speech over a silent reference were bit-exact dry. A silent mic produced exact zero, including after training. With ±1 ms callback scheduling jitter the far-only score fell to 13.12 dB. After a simulated 250 ms reference outage, alignment returned in 889 ms and the processor reported measured cancellation after 931 ms. The separate cold-start room simulations include acquisition and longer reflections. Far-only ERLE on those development fixtures was about 0.75–2.10 dB. On one Linux Release run, the additional delay search and reduction diagnostics increased offline DSP time by roughly 1.7–2.1× over 0.1.1. The largest measured 256-frame block took 0.421 ms against a 5.33 ms deadline. Those timings exclude device capture and the Wave Link callback. Physical attenuation, voice retention and deadline performance require a field measurement.
 
 ## Pinned dependency and licenses
 

@@ -1,5 +1,6 @@
 #include "packet_queue.hpp"
 #include "reference_capture.hpp"
+#include "reference_fragment.hpp"
 #include "sample_format.hpp"
 
 #include <array>
@@ -117,6 +118,56 @@ void sample_formats() {
   check(!valid_format(format), "valid bits cannot exceed container width");
 }
 
+void timestamp_error_fragments() {
+  using namespace buncancel::capture;
+  using namespace buncancel::capture::detail;
+  SampleFormat format;
+  format.encoding = Encoding::signed_pcm;
+  format.bits = format.valid_bits = 16;
+  format.channels = 2;
+  constexpr std::uint32_t frames = ReferencePacket::max_frames + 19;
+  std::array<std::uint8_t, frames * 4> pcm{};
+  for (std::uint32_t i = 0; i < frames; ++i) {
+    pcm[i * 4 + 1] = 0x40; // Left +0.5.
+    pcm[i * 4 + 3] = 0xC0; // Right -0.5.
+  }
+  bool discontinuity = false;
+  for (std::uint32_t offset = 0; offset < frames;) {
+    const auto packet =
+        reference_fragment(pcm.data(), format, frames, offset, 1000, 12345678,
+                           7, false, false, discontinuity);
+    check(packet.qpc_position_100ns == 0 && packet.discontinuity &&
+              discontinuity,
+          "timestamp errors must remain unusable at every fragment offset");
+    check(packet.device_position == 1000 + offset && packet.generation == 7,
+          "timestamp errors must preserve source positions and generation");
+    for (std::uint32_t i = 0; i < packet.frame_count; ++i) {
+      check(packet.samples[2 * i] == 0.5F && packet.samples[2 * i + 1] == -0.5F,
+            "timestamp errors must preserve PCM for raw source metering");
+    }
+    offset += packet.frame_count;
+  }
+  const auto recovery =
+      reference_fragment(pcm.data(), format, frames, 512, 2000, 23456789, 7,
+                         false, true, discontinuity);
+  check(
+      recovery.discontinuity && !discontinuity &&
+          recovery.qpc_position_100ns == 23456789 + 512ULL * 10000000 / 48000,
+      "first valid timestamp after an error must reset and retain offset time");
+  const auto normal =
+      reference_fragment(pcm.data(), format, frames, 0, 3000, 34567890, 7,
+                         false, true, discontinuity);
+  check(!normal.discontinuity && !discontinuity,
+        "successful timestamp recovery must permit subsequent continuous data");
+  const auto silent =
+      reference_fragment(nullptr, format, frames, 512, 4000, 45678901, 7, true,
+                         false, discontinuity);
+  check(
+      silent.qpc_position_100ns == 0 && silent.samples[0] == 0 &&
+          silent.discontinuity && discontinuity,
+      "silent timestamp-error fragments must remain explicit zero-QPC silence");
+}
+
 void lifecycle_contract() {
   using namespace buncancel::capture;
   ReferenceCapture capture;
@@ -146,6 +197,7 @@ int main() {
   queue_boundaries();
   queue_concurrency();
   sample_formats();
+  timestamp_error_fragments();
   lifecycle_contract();
   if (failures != 0) {
     std::cerr << failures << " capture contract failures\n";
