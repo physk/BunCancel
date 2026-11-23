@@ -6,7 +6,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(buncancel-capture PRIVATE Threads::Threads)
 if(WIN32)
   target_compile_definitions(buncancel-capture PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
-  target_link_libraries(buncancel-capture PRIVATE ole32 uuid propsys ksguid)
+  target_link_libraries(buncancel-capture PRIVATE ole32 uuid propsys)
 endif()
 
 if(BUILD_TESTING)

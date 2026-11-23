@@ -124,9 +124,11 @@ bool parse_format(const WAVEFORMATEX &wave, detail::SampleFormat &format) {
              wave.cbSize >=
                  sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
     const auto &extended = reinterpret_cast<const WAVEFORMATEXTENSIBLE &>(wave);
-    if (IsEqualGUID(extended.SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+    constexpr GUID float_format{STATIC_KSDATAFORMAT_SUBTYPE_IEEE_FLOAT};
+    constexpr GUID pcm_format{STATIC_KSDATAFORMAT_SUBTYPE_PCM};
+    if (IsEqualGUID(extended.SubFormat, float_format)) {
       format.encoding = detail::Encoding::floating_point;
-    } else if (IsEqualGUID(extended.SubFormat, KSDATAFORMAT_SUBTYPE_PCM)) {
+    } else if (IsEqualGUID(extended.SubFormat, pcm_format)) {
       format.encoding = detail::Encoding::signed_pcm;
     } else {
       return false;
