@@ -456,6 +456,82 @@ void trainedMicrophoneMute() {
   engine.process(mic.data(), reference.data(), output.data(), count);
   require(output == mic, "digital mute protection gated quiet near speech");
 }
+void postAlignmentLearning() {
+  // Field-level reference and a 252 ms effective lag. A reflection changes
+  // after the foreground has warmed up, leaving that old model below the
+  // 0.98 adaptation-coherence gate despite a correct stable delay.
+  constexpr int rate = 48000;
+  constexpr int count = rate * 8;
+  constexpr int delay = 12096;
+  auto reference = noise(count, 72);
+  for (auto &sample : reference) {
+    sample *= 0.086F;
+  }
+  std::vector<float> mic(count), output(count);
+  for (int i = delay + 32; i < count; ++i) {
+    mic[i] = 1.2F * reference[i - delay] +
+             (i < rate * 3 ? 0.05F : 0.9F) * reference[i - delay - 32];
+  }
+  buncancel::Aec engine(rate);
+  engine.process(mic.data(), reference.data(), output.data(), count - 256);
+  const auto diagnostic = engine.diagnostics();
+  require(engine.aligned() && engine.delaySamples() == delay,
+          "changed reflection lost a supported delay");
+  require(energy(output, rate * 6, count) < energy(mic, rate * 6, count) * 0.01,
+          "post-warmup coherence freeze prevented path relearning");
+  require(diagnostic.shadowPromotions > 0 &&
+              diagnostic.shadowAdaptedSamples > 0 &&
+              diagnostic.adaptedSamples >= 2048 && diagnostic.weightsNorm > 1,
+          "validated shadow learning lacked diagnostic evidence");
+  require(diagnostic.liveConfidence > 0.65F && diagnostic.predictionRms > 0 &&
+              diagnostic.microphoneRms > 0 &&
+              diagnostic.outputRms < diagnostic.microphoneRms * 0.1F &&
+              diagnostic.subtractionGain > 0 && diagnostic.subtractionActive &&
+              diagnostic.samplesSinceReset > static_cast<unsigned>(rate) &&
+              diagnostic.filterResetCount > 0,
+          "active filter diagnostics did not describe processed audio");
+  // A valid audio block may end in an exact zero crossing. Activity belongs
+  // to the processed block, rather than the numerical value of its last sample.
+  mic[count - 1] = 0;
+  reference[count - 1] = 0;
+  engine.process(mic.data() + count - 256, reference.data() + count - 256,
+                 output.data() + count - 256, 256);
+  require(engine.diagnostics().subtractionActive &&
+              engine.diagnostics().reductionValid,
+          "a trailing digital zero hid real current-block subtraction");
+  const auto resets = diagnostic.filterResetCount;
+  engine.process(mic.data(), nullptr, output.data(), rate / 10);
+  const auto dry = engine.diagnostics();
+  require(std::equal(output.begin(), output.begin() + rate / 10, mic.begin()) &&
+              dry.filterResetCount > resets &&
+              dry.samplesSinceReset == static_cast<unsigned>(rate / 10) &&
+              dry.adaptedSamples == 0 && dry.weightsNorm == 0 &&
+              dry.predictionRms == 0 && !dry.subtractionActive,
+          "reference loss retained a learned or active filter");
+}
+
+void repeatedBroadbandAmbiguity() {
+  constexpr int rate = 48000;
+  constexpr int count = rate * 3;
+  constexpr int period = 576;
+  constexpr int delay = 12209;
+  const auto motif = noise(period, 811);
+  std::vector<float> reference(count), mic(count), output(count);
+  for (int i = 0; i < count; ++i) {
+    reference[i] = motif[i % period];
+    mic[i] = i >= delay ? reference[i - delay] * 0.7F : 0;
+  }
+  buncancel::Aec engine(rate);
+  engine.process(mic.data(), reference.data(), output.data(), count);
+  const auto diagnostic = engine.diagnostics();
+  require(!engine.aligned() && output == mic,
+          "separated periodic broadband aliases modified the microphone");
+  require(diagnostic.state == buncancel::Aec::AlignmentState::Ambiguous &&
+              diagnostic.competingPeakCorrelation > 0.9F &&
+              !diagnostic.candidateValid && !diagnostic.subtractionActive,
+          "separated delay aliases were not diagnosed as ambiguous");
+}
+
 } // namespace
 
 int main() {
@@ -470,6 +546,8 @@ int main() {
     acquisitionDiagnostics();
     echoDisappearance();
     trainedMicrophoneMute();
+    postAlignmentLearning();
+    repeatedBroadbandAmbiguity();
     std::cout << "AEC deterministic regression checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << "AEC regression failed: " << error.what() << '\n';

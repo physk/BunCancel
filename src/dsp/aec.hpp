@@ -36,12 +36,35 @@ public:
     int peakLagSamples = 0;
     float peakCorrelation = 0;
     bool peakValid = false;
+    float competingPeakCorrelation = 0;
     int candidateLagSamples = 0;
     bool candidateValid = false;
     // Rolling mic/output power reduction with coherent subtraction evidence.
     // This is not ERLE and cannot distinguish near-end speech from echo.
     float reductionDb = 0;
     bool reductionValid = false;
+    // Foreground updates include samples learned by a promoted shadow model.
+    // Counters and RMS describe model activity, not far-only echo quality.
+    std::uint64_t adaptedSamples = 0;
+    std::uint64_t shadowAdaptedSamples = 0;
+    std::uint64_t shadowPromotions = 0;
+    std::uint64_t filterResetCount = 0;
+    // Actual processed samples since the most recent filter invalidation.
+    std::uint64_t samplesSinceReset = 0;
+    float weightsNorm = 0;
+    float predictionRms = 0;
+    float outputRms = 0;
+    float microphoneRms = 0;
+    float subtractionRms = 0;
+    float subtractionGain = 0;
+    float doubleTalkFreezeRatio = 0;
+    float liveConfidence = 0;
+    float predictionCoherence = 0;
+    // Uses applied subtraction in the last completed process call, including
+    // blocks whose final sample is an exact zero. A wholly silent call is
+    // false.
+    bool subtractionActive = false;
+    bool shadowValidating = false;
   };
   explicit Aec(int sampleRate);
   void process(const float *mic, const float *reference, float *out,
@@ -68,6 +91,9 @@ private:
   float correlation(int lag, std::uint64_t end) const noexcept;
   void searchDelay() noexcept;
   void searchExcludedDelay() noexcept;
+  void clearFilter() noexcept;
+  void updateShadow(float microphone, float energy,
+                    float foregroundOutput) noexcept;
 
   std::size_t historyMask_ = 0;
   int sampleRate_;
@@ -78,19 +104,24 @@ private:
   std::vector<float> microphone_;
   std::vector<float> weights_;
   std::vector<float> tapValues_;
+  std::vector<float> shadowWeights_;
   std::uint64_t time_ = 0;
   std::uint64_t scanEnd_ = 0;
   int scanLag_ = 0;
   int bestLag_ = 0;
+  int secondLag_ = 0;
   int delay_ = 0;
   int strongCandidates_ = 0;
   int diagnosticScanLag_ = 0;
   int diagnosticBestLag_ = 0;
+  int diagnosticSecondLag_ = 0;
   int diagnosticStrongCandidates_ = 0;
   int lostSamples_ = 0;
   float bestScore_ = 0;
+  float secondScore_ = 0;
   float confidence_ = 0;
   float diagnosticBestScore_ = 0;
+  float diagnosticSecondScore_ = 0;
   std::uint64_t diagnosticScanEnd_ = 0;
   Diagnostics modelDiagnostics_;
   Diagnostics excludedDiagnostics_;
@@ -101,6 +132,19 @@ private:
   double predictedPower_ = 0;
   double crossPower_ = 0;
   std::uint64_t adaptedSamples_ = 0;
+  std::uint64_t shadowAdaptedSamples_ = 0;
+  std::uint64_t shadowPromotions_ = 0;
+  std::uint64_t filterResetCount_ = 0;
+  std::uint64_t filterAgeSamples_ = 0;
+  int shadowPhaseSamples_ = 0;
+  int shadowEligibleSamples_ = 0;
+  double shadowMicEnergy_ = 0;
+  double shadowPredictionEnergy_ = 0;
+  double shadowCrossEnergy_ = 0;
+  double shadowForegroundError_ = 0;
+  double doubleTalkFreezeRatio_ = 0;
+  double lastProcessSubtractionPower_ = 0;
+  float subtractionGain_ = 0;
   bool aligned_ = false;
   bool missing_ = false;
 };

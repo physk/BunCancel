@@ -211,12 +211,14 @@ void exercise(int block) {
   tracking = true;
   process(mic.data(), reference.data(), frames);
   const bool initiallyAligned = engine.aligned();
+  const auto active = engine.diagnostics();
   process(silence.data(), silence.data(), rate);
   const bool lostOnSilence = !engine.aligned();
   process(mic.data(), reference.data(), frames);
   const bool reacquiredAfterSilence = engine.aligned();
   process(mic.data(), nullptr, frames);
   const bool lostOnDropout = !engine.aligned();
+  const auto disconnected = engine.diagnostics();
   const bool dropoutIsDry = output == mic;
   process(mic.data(), reference.data(), frames);
   const bool reacquiredAfterDropout = engine.aligned();
@@ -227,6 +229,10 @@ void exercise(int block) {
   tracking = false;
   require(allocationCalls == 0, "prepared process/reset allocated memory");
   require(deallocationCalls == 0, "prepared process/reset freed memory");
+  require(active.adaptedSamples > 0 && active.predictionRms > 0 &&
+              disconnected.adaptedSamples == 0 &&
+              !disconnected.subtractionActive,
+          "allocation test did not observe active and disconnected telemetry");
   require(initiallyAligned,
           "allocation test did not exercise aligned processing");
   require(lostOnSilence && reacquiredAfterSilence,
