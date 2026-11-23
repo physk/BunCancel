@@ -15,7 +15,7 @@ set(PROJECT_VERSION ${BunCancel_VERSION})
 smtg_add_vst3plugin(BunCancel plugin.cpp editor.cpp)
 target_compile_features(BunCancel PRIVATE cxx_std_20)
 target_compile_definitions(BunCancel PRIVATE UNICODE _UNICODE)
-target_link_libraries(BunCancel PRIVATE sdk buncancel-dsp buncancel-capture user32 gdi32)
+target_link_libraries(BunCancel PRIVATE sdk buncancel-dsp buncancel-capture buncancel-local-capture user32 gdi32 shell32)
 target_include_directories(BunCancel PRIVATE "${vst3sdk_SOURCE_DIR}" "${PROJECT_SOURCE_DIR}/src/capture/windows")
 # Redistribute the exact SDK notices with the binary bundle.
 foreach(component IN ITEMS base cmake pluginterfaces public.sdk)
@@ -32,6 +32,20 @@ add_custom_command(TARGET BunCancel POST_BUILD
         "$<TARGET_FILE_DIR:BunCancel>/../Resources/licenses/BunCancel-LICENSE.txt")
 
 if(BUILD_TESTING)
+    # The signal host compiles the production processor against a generated
+    # capture backend. Only the distributed plugin links the WASAPI backend.
+    add_executable(buncancel-processor-signal-tests
+        ${PROJECT_SOURCE_DIR}/tests/plugin/test_processor_signal.cpp
+        ${PROJECT_SOURCE_DIR}/src/capture/reference_timeline.cpp
+        ${vst3sdk_SOURCE_DIR}/public.sdk/source/common/memorystream.cpp)
+    target_compile_definitions(buncancel-processor-signal-tests PRIVATE UNICODE _UNICODE)
+    target_include_directories(buncancel-processor-signal-tests PRIVATE
+        ${vst3sdk_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src/capture
+        ${PROJECT_SOURCE_DIR}/src/capture/windows)
+    target_link_libraries(buncancel-processor-signal-tests PRIVATE
+        sdk_hosting sdk buncancel-dsp buncancel-local-capture ole32 user32 gdi32 shell32 uuid)
+    add_test(NAME vst3-processor-signal COMMAND buncancel-processor-signal-tests)
+
     add_executable(buncancel-editor-smoke
         ${PROJECT_SOURCE_DIR}/tests/plugin/editor_smoke.cpp
         ${vst3sdk_SOURCE_DIR}/public.sdk/source/common/memorystream.cpp)

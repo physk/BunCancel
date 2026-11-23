@@ -52,7 +52,7 @@ Requirements are marked MUST, SHOULD, or LATER. They are design requirements unl
 
 ## R6 — Privacy, legal and maintenance (MUST)
 
-- Local processing only by default. No telemetry, automatic uploads or recording retention.
+- Keep signal processing and diagnostics local. Default operation retains only bounded processing history and aggregate meter readings. Saving audio requires explicit consent for each short diagnostic capture. Never automate recording through a saved setting or upload recordings.
 - All media assets must be created in the project or carry a redistributable license and attribution.
 - Original AEC code only; do not copy or relicense another AEC engine as original work.
 - Third-party dependencies and SDK licenses require per-version review.

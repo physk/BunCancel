@@ -6,7 +6,7 @@ integration; host/device and physical audio acceptance gates remain open.
 
 ## Install or upgrade the Windows bundle
 
-1. Use the editor-enabled build (plugin version 0.1.3). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
+1. Use the editor-enabled build (plugin version 0.1.4). Extract the ZIP to a staging directory outside every VST3 search path. Check that it contains a folder named `BunCancel.vst3`, with `Contents/x86_64-win/BunCancel.vst3` and `Contents/Resources/moduleinfo.json` inside.
 2. Close Wave Link and any other hosts using the plugin. Save the current host settings. In the VST3 search directory, the existing `BunCancel.vst3` may be a single file or a folder with that same name. Move the **entire existing item** to a backup directory outside the scan paths. Keep the backup until the upgrade works.
 3. Copy the **outer folder** from staging into the search directory. A typical resulting path is `C:\Program Files\Common Files\VST3\BunCancel.vst3\Contents\x86_64-win\BunCancel.vst3`. Leave the resources and inner binary together. Installing a second loose copy of the inner binary can make the host resolve the wrong plugin.
 4. Reopen the host, rescan if available, and open BunCancel's editor on the microphone chain. The editor should show the playback-reference picker, enable and bypass controls, and processing status. To roll back, close the host, move the new bundle out of the scan path and restore the backed-up item under its original name.
@@ -35,6 +35,8 @@ A subsequent 0.1.2 field observation showed a mono microphone at −34.0 dBFS RM
 2. Enable AEC and leave bypass off. With a valid reference stream, **Ready** is the expected result even in a quiet room. The mic continues through and the engine monitors automatically. There is no calibration step.
 3. Read the **BunCancel** mic and reference RMS/peak values during normal speech and playback. The two host mixer meters can be active even if the selected endpoint supplies different PCM. A silent plugin reference with audible playback points to the reference route. A silent plugin microphone during speech points to the plugin input route.
 4. If reference interruptions accumulate, check device availability and the host and endpoint sample rates shown in the editor. A steady **Ready** with both meters moving can simply mean the playback produces no detectable mic leakage. **Cancelling** indicates recent aligned subtraction with measured reduction. The estimate is a live diagnostic, not a ground-truth ERLE score.
+
+For a quiet block or persistent leakage, the editor also reports the last three seconds of mic, raw reference, downmix and output levels. Packet receipt age, last above-threshold activity and last underrun have separate labels. The optional three-second recording and offline analysis are described in the [local field guide](FIELD_DIAGNOSTICS.md).
 
 The endpoint picker contains explicit render-loopback and capture endpoints
 exposed by Windows, ordered by stable endpoint ID. An endpoint name alone does

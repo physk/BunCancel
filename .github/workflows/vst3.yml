@@ -12,9 +12,9 @@ jobs:
       - name: Configure pinned SDK and native plugin
         run: cmake -S . -B build-vst3 -A x64 -DBUNCANCEL_BUILD_VST3=ON
       - name: Build plugin, editor smoke host and SDK validator
-        run: cmake --build build-vst3 --config Release --target buncancel-editor-smoke buncancel-timeline-tests buncancel-pipeline-tests buncancel-post-alignment-tests validator --parallel
+        run: cmake --build build-vst3 --config Release --target buncancel-offline buncancel-editor-smoke buncancel-processor-signal-tests buncancel-activity-tests buncancel-local-capture-tests buncancel-timeline-tests buncancel-pipeline-tests buncancel-post-alignment-tests validator --parallel
       - name: Verify timing, post-alignment subtraction and voice preservation
-        run: ctest --test-dir build-vst3 -C Release -R "^(reference-(timeline|pipeline)|post-alignment)$" --no-tests=error --verbose
+        run: ctest --test-dir build-vst3 -C Release -R "^(reference-(timeline|pipeline)|post-alignment|activity-window|local-capture(-replay)?|vst3-processor-signal)$" --no-tests=error --verbose
       - name: Open, operate and reopen the packaged editor in a Windows host window
         run: ctest --test-dir build-vst3 -C Release -R "^vst3-editor$" --no-tests=error --output-on-failure
       - name: Locate and validate the packaged module
@@ -32,9 +32,19 @@ jobs:
           }
           New-Item -ItemType Directory -Force package | Out-Null
           Copy-Item $module.FullName package -Recurse
+          $runner = Get-ChildItem build-vst3 -Recurse -File -Filter buncancel-offline.exe | Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (!$runner) { throw 'Offline replay runner missing' }
+          New-Item -ItemType Directory -Force diagnostic-tools | Out-Null
+          Copy-Item -Path $runner.FullName, tools/analyze_capture.py, docs/FIELD_DIAGNOSTICS.md, LICENSE -Destination diagnostic-tools/
       - uses: actions/upload-artifact@v4
         with:
           name: BunCancel-experimental-Windows-x64-unsigned
           path: package/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BunCancel-local-diagnostic-tools-Windows-x64
+          path: diagnostic-tools/
           if-no-files-found: error
           retention-days: 14
