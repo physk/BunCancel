@@ -148,14 +148,18 @@ void require(bool condition, const char *message) {
 
 std::vector<float> program(std::uint32_t seed) {
   std::vector<float> signal(frames);
+  const double fundamental = 120 + seed % 89;
+  const double modulation = 0.27 + (seed % 13) * 0.017;
+  const double syllableRate = 1.8 + (seed % 17) * 0.11;
   double smooth = 0;
   for (int i = 0; i < frames; ++i) {
     seed = seed * 1664525U + 1013904223U;
     const double noise = static_cast<double>(seed >> 8) / 16777216.0 - 0.5;
     smooth = 0.75 * smooth + 0.25 * noise;
     const double t = static_cast<double>(i) / rate;
-    const double phase = 6.283185307179586 * (147 * t + 1.8 * std::sin(t));
-    const double envelope = 0.3 + 0.7 * std::pow(std::sin(t * 8.3), 2);
+    const double phase =
+        6.283185307179586 * (fundamental * t + 1.8 * std::sin(t * modulation));
+    const double envelope = 0.3 + 0.7 * std::pow(std::sin(t * syllableRate), 2);
     signal[i] =
         static_cast<float>(0.09 * envelope * (smooth + 0.12 * std::sin(phase)));
   }
@@ -452,13 +456,24 @@ void run(bool echo, bool quiet) {
       const auto path = destination / name;
       require(std::filesystem::file_size(path) == 44 + 3 * rate * sizeof(float),
               "production opt-in WAV is incomplete or has the wrong format");
-      if (std::string(name) != "reference.wav") {
-        std::ifstream file(path, std::ios::binary);
-        file.seekg(44);
-        std::vector<float> audio(3 * rate);
-        file.read(reinterpret_cast<char *>(audio.data()),
-                  static_cast<std::streamsize>(audio.size() * sizeof(float)));
-        require(static_cast<bool>(file), "production opt-in WAV read failed");
+      std::ifstream file(path, std::ios::binary);
+      file.seekg(44);
+      std::vector<float> audio(3 * rate);
+      file.read(reinterpret_cast<char *>(audio.data()),
+                static_cast<std::streamsize>(audio.size() * sizeof(float)));
+      require(static_cast<bool>(file), "production opt-in WAV read failed");
+      if (std::string(name) == "reference.wav") {
+        double differenceEnergy = 0, sourceEnergy = 0;
+        for (int i = 0; i < 3 * rate; ++i) {
+          const int index = 4 * rate + i - 960;
+          const double expected = 0.5 * (left[index] + right[index]);
+          const double difference = audio[i] - expected;
+          differenceEnergy += difference * difference;
+          sourceEnergy += expected * expected;
+        }
+        require(differenceEnergy / sourceEnergy < 1.0e-3,
+                "saved reference is not the timestamp-mapped stereo downmix");
+      } else {
         const auto &expected =
             std::string(name) == "mic_input.wav" ? mic : output;
         require(
@@ -466,6 +481,7 @@ void run(bool echo, bool quiet) {
             "saved opt-in WAV differs from actual production callback PCM");
       }
     }
+
     std::ifstream timeline(destination / "timeline.json");
     const std::string json((std::istreambuf_iterator<char>(timeline)), {});
     require(json.find("\"captured_frames\":144000") != std::string::npos &&
