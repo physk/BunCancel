@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -10,6 +11,11 @@ namespace buncancel {
 // The caller supplies reference samples on the microphone clock. Positive delay
 // means playback precedes its arrival at the microphone. No lookahead is used.
 // This class is single-thread owned, including its diagnostic accessors.
+// Scope: <= 333 ms delay, 128-tap tail, mono reference already on the mic
+// clock. Periodic ambiguity and direct self-monitoring degrade to dry
+// microphone. Delayed near-end contamination cannot be identified reliably from
+// two signals; the capture/routing layer must keep the microphone out of the
+// reference.
 class Aec {
 public:
   explicit Aec(int sampleRate);
@@ -26,9 +32,8 @@ public:
 private:
   static constexpr int taps_ = 128;
   static constexpr int correlationPoints_ = 128;
-  static constexpr int correlationStride_ = 4;
-  static constexpr int correlationSpan_ =
-      correlationPoints_ * correlationStride_;
+  int correlationSpan_ = 0;
+  std::array<int, correlationPoints_> correlationOffsets_{};
   float history(const std::vector<float> &values,
                 std::uint64_t time) const noexcept;
   float correlation(int lag, std::uint64_t end) const noexcept;

@@ -8,7 +8,10 @@
 namespace buncancel {
 namespace {
 float bounded(float value) noexcept {
-  return std::isfinite(value) ? std::clamp(value, -16.0F, 16.0F) : 0.0F;
+  if (!std::isfinite(value) || std::abs(value) < 1.0e-20F) {
+    return 0;
+  }
+  return std::clamp(value, -16.0F, 16.0F);
 }
 } // namespace
 
@@ -16,6 +19,16 @@ Aec::Aec(int sampleRate) : sampleRate_(sampleRate), maxDelay_(sampleRate / 3) {
   if (sampleRate < 8000 || sampleRate > 192000) {
     throw std::invalid_argument(
         "AEC sample rate must be between 8000 and 192000 Hz");
+  }
+  correlationSpan_ = sampleRate_ / 5;
+  // Sparse, nonuniform observations across 200 ms retain a fixed cost while
+  // distinguishing changing harmonic signals from a repeated pure tone.
+  std::uint32_t seed = 101;
+  for (int i = 0; i < correlationPoints_; ++i) {
+    seed = seed * 1664525U + 1013904223U;
+    const int width = correlationSpan_ / correlationPoints_;
+    correlationOffsets_[static_cast<std::size_t>(i)] =
+        i * width + static_cast<int>(seed % static_cast<unsigned>(width));
   }
   const auto size = std::bit_ceil(
       static_cast<std::size_t>(3 * maxDelay_ + correlationSpan_ + taps_ + 8));
@@ -57,7 +70,8 @@ float Aec::correlation(int lag, std::uint64_t end) const noexcept {
   double micEnergy = 0;
   double refEnergy = 0;
   for (int i = 0; i < correlationPoints_; ++i) {
-    const auto t = end - static_cast<std::uint64_t>(i * correlationStride_);
+    const auto t = end - static_cast<std::uint64_t>(
+                             correlationOffsets_[static_cast<std::size_t>(i)]);
     // First differences reduce low-frequency periodic ambiguity. This is
     // evidence for alignment only, not a modification of the output signal.
     const double m = history(microphone_, t) - history(microphone_, t - 1);
@@ -109,7 +123,7 @@ void Aec::searchDelay() noexcept {
     }
     aligned_ = true;
   }
-  confidence_ = aligned_ ? correlation(delay_, scanEnd_) : bestScore_;
+  confidence_ = aligned_ ? correlation(delay_, scanEnd_) : 0;
   scanLag_ = 0;
 }
 
@@ -158,7 +172,7 @@ void Aec::process(const float *mic, const float *reference, float *out,
       }
     }
     const float error = m - prediction;
-    constexpr double smoothing = 0.995;
+    const double smoothing = 1.0 - 1.0 / (0.02 * sampleRate_);
     micPower_ = smoothing * micPower_ + (1 - smoothing) * m * m;
     predictedPower_ =
         smoothing * predictedPower_ + (1 - smoothing) * prediction * prediction;
@@ -166,10 +180,13 @@ void Aec::process(const float *mic, const float *reference, float *out,
     const double coherence =
         crossPower_ * crossPower_ / (micPower_ * predictedPower_ + 1.0e-20);
     const bool warming =
-        adaptedSamples_ < static_cast<std::uint64_t>(sampleRate_ / 10);
-    const bool doubleTalk = !warming && coherence < 0.8;
+        adaptedSamples_ <
+        static_cast<std::uint64_t>(std::max(sampleRate_ / 10, 2048));
+    const bool doubleTalk = warming ? confidence_ < 0.65F : coherence < 0.98;
     if (aligned_ && energy > 1.0e-8F && !doubleTalk) {
-      const float step = 0.15F * error / (energy + 1.0e-6F);
+      // A fixed regularizer limits corrections in reference envelope gaps,
+      // where unmodeled long-tail echo otherwise drives huge coefficients.
+      const float step = 0.15F * error / (energy + 0.01F);
       for (int k = 0; k < taps_; ++k) {
         auto &w = weights_[static_cast<std::size_t>(k)];
         w = std::clamp(w + step * tapValues_[static_cast<std::size_t>(k)],
@@ -178,9 +195,24 @@ void Aec::process(const float *mic, const float *reference, float *out,
           w = 0;
         }
       }
+      float norm = 0;
+      for (const auto weight : weights_) {
+        norm += std::abs(weight);
+      }
+      if (norm > 4.0F) {
+        // Bound aggregate gain, rather than only bounding each coefficient.
+        const float scale = 4.0F / norm;
+        for (auto &weight : weights_) {
+          weight *= scale;
+        }
+      }
       ++adaptedSamples_;
     }
-    out[i] = bounded(error);
+    const float subtractionGain = static_cast<float>(
+        std::clamp(crossPower_ / (predictedPower_ + 1.0e-12), 0.0, 1.0));
+    // A stale model must not amplify interference. Constrained regression
+    // decreases cancellation when its prediction ceases to explain the mic.
+    out[i] = bounded(m - subtractionGain * prediction);
     ++time_;
   }
 }

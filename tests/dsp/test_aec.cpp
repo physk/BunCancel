@@ -25,8 +25,22 @@ void *operator new(std::size_t size) {
   throw std::bad_alloc();
 }
 
-void operator delete(void *memory) noexcept { std::free(memory); }
-void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void operator delete(void *memory) noexcept {
+  std::free(memory);
+}
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void operator delete(void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 
 namespace {
 void require(bool condition, const char *message) {
@@ -221,13 +235,78 @@ void sampleRatesAndAllocation() {
     require(allocations == 0, "process allocated memory");
     require(engine.aligned() && engine.delaySamples() == delay,
             "sample rate matrix alignment failed");
-    require(energy(output, rate, count) < energy(mic, rate, count) * 0.01,
+    require(energy(output, rate * 3 / 2, count) <
+                energy(mic, rate * 3 / 2, count) * 0.01,
             "sample rate matrix cancellation failed");
     countAllocations = true;
     engine.process(mic.data(), nullptr, output.data(), count);
     engine.reset();
     countAllocations = false;
     require(allocations == 0, "discontinuity handling allocated memory");
+  }
+}
+
+std::vector<float> harmonics(int count, int rate, double pitch,
+                             std::uint32_t seed) {
+  const auto phases = noise(5, seed);
+  std::vector<float> result(count);
+  constexpr double pi = 3.141592653589793;
+  for (int i = 0; i < count; ++i) {
+    const double t = static_cast<double>(i) / rate;
+    const double envelope =
+        0.2 + 0.8 * std::pow(std::max(0.0, std::sin(2 * pi * 3.5 * t)), 2);
+    const double f0 = pitch * (1 + 0.06 * std::sin(2 * pi * 1.3 * t));
+    double value = 0;
+    for (int k = 0; k < 5; ++k) {
+      value += std::sin(2 * pi * f0 * (k + 1) * t + phases[k] * 12) / (k + 1);
+    }
+    result[i] = static_cast<float>(0.36 * envelope * value / 2.25);
+  }
+  return result;
+}
+
+void modulatedHarmonicDoubleTalk() {
+  // Independent development reproducer: colored periodic input, envelope
+  // gaps and an echo tail longer than the baseline filter. This exposed
+  // divergence that stationary broadband tests did not exercise.
+  constexpr int rate = 48000;
+  constexpr int count = rate * 3;
+  auto reference = harmonics(count, rate, 165, 97);
+  auto near = harmonics(count, rate, 121, 101);
+  std::fill(reference.begin() + count * 7 / 10, reference.end(), 0);
+  std::fill(near.begin(), near.begin() + count * 4 / 10, 0);
+  for (const bool stronglyCoupled : {false, true}) {
+    const int delay = stronglyCoupled ? 288 : 1104;
+    std::vector<float> mic(count);
+    std::vector<float> output(count);
+    const auto source = [&](int i) { return i >= 0 ? reference[i] : 0.0F; };
+    for (int i = 0; i < count; ++i) {
+      const float echo = stronglyCoupled
+                             ? 1.5F * (0.93F * source(i - delay) +
+                                       0.28F * source(i - delay - 192) -
+                                       0.19F * source(i - delay - 864))
+                             : 0.68F * (0.75F * source(i - delay) +
+                                        0.34F * source(i - delay - 576) -
+                                        0.19F * source(i - delay - 2256));
+      mic[i] = echo + near[i];
+    }
+    buncancel::Aec engine(rate);
+    engine.process(mic.data(), reference.data(), output.data(), count);
+    double dryError = 0;
+    double wetError = 0;
+    double cross = 0;
+    double nearEnergy = 0;
+    for (int i = count * 4 / 10; i < count * 7 / 10; ++i) {
+      dryError += std::pow(mic[i] - near[i], 2);
+      wetError += std::pow(output[i] - near[i], 2);
+      cross += static_cast<double>(output[i]) * near[i];
+      nearEnergy += static_cast<double>(near[i]) * near[i];
+      require(std::abs(output[i]) < 1, "harmonic double talk caused overload");
+    }
+    require(cross / nearEnergy > 0.9,
+            "harmonic double talk attenuated near-end voice");
+    require(wetError <= dryError * 1.1,
+            "harmonic double talk amplified interference");
   }
 }
 } // namespace
@@ -240,6 +319,7 @@ int main() {
     safety();
     unusableAlignment();
     sampleRatesAndAllocation();
+    modulatedHarmonicDoubleTalk();
     std::cout << "AEC deterministic regression checks passed\n";
   } catch (const std::exception &error) {
     std::cerr << "AEC regression failed: " << error.what() << '\n';
