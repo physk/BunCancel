@@ -59,6 +59,6 @@ Record exact source URL/license/consent and SHA-256 for external assets. Keep li
 5. Nightly/extended tests broaden random seeds and acoustic paths with no metric cherry-picking.
 6. Physical Wave Link/Windows acceptance remains a separate gate until explicitly automated on attached hardware.
 
-## Current state
+## Current evidence
 
-The Python generator and structural tests are an initial **test-lab bootstrap only**. The AEC executable, scorer, objective baseline and verified real-speech corpus are still to be implemented.
+The development lab generates and scores processed WAVs through the portable C++ engine. See [baseline measurements](BASELINE.md) for conditions, reference comparisons and open gates. Physical capture, real speech and perceptual acceptance require separate evidence.

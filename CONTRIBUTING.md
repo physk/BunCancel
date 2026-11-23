@@ -22,7 +22,7 @@ Requires Python 3.10+:
 - python tests/audio/generate_fixtures.py --out build/fixtures
 - python -m unittest discover -s tests/audio -p "test_*.py" -v
 
-Current CI checks only fixture and repository scaffolding; it is **not** a VST3 build or cancellation-quality certification.
+See README.md for the CMake, CTest and offline A/B commands. Report synthetic metrics separately from host and hardware acceptance.
 
 ## Attribution and content
 
